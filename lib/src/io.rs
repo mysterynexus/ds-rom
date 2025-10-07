@@ -168,7 +168,7 @@ pub async fn read_dir<P: AsRef<Path>>(path: P) -> Result<Vec<std::path::PathBuf>
     while let Some(next) = stream.next().await {
         match next {
             Ok(meta) => {
-                let entry_path = std::path::PathBuf::from(meta.path.as_ref());
+                let entry_path = std::path::PathBuf::from("/").join(meta.path.as_ref());
                 entries.push(entry_path);
             }
             Err(error) => {
