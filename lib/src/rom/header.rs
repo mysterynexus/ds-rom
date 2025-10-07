@@ -164,7 +164,7 @@ impl Header {
             normal_cmd_setting: self.original.normal_cmd_setting,
             key1_cmd_setting: self.original.key1_cmd_setting,
             banner_offset: context.banner_offset.map(|b| b.offset).expect("Banner offset must be known"),
-            secure_area_crc: if let Some(key) = context.blowfish_key {
+            secure_area_crc: if let Some(key) = &context.blowfish_key {
                 arm9.secure_area_crc(key, self.original.gamecode.to_le_u32())
             } else {
                 0

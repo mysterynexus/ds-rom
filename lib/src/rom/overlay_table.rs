@@ -1,25 +1,24 @@
-use crate::crypto::hmac_sha1::HmacSha1;
-
 use super::{
     raw::{self, HmacSha1Signature},
     Arm9, Overlay, OverlayError,
 };
+use crate::crypto::hmac_sha1::HmacSha1;
 
 /// An overlay table, used for both ARM9 and ARM7 overlays. This is the plain struct, see the raw one [here](super::raw::OverlayTable).
 #[derive(Clone, Default)]
-pub struct OverlayTable<'a> {
-    overlays: Vec<Overlay<'a>>,
+pub struct OverlayTable {
+    overlays: Vec<Overlay>,
     signature: Option<HmacSha1Signature>,
 }
 
-impl<'a> OverlayTable<'a> {
+impl OverlayTable {
     /// Creates a new [`OverlayTable`].
-    pub fn new(overlays: Vec<Overlay<'a>>) -> Self {
+    pub fn new(overlays: Vec<Overlay>) -> Self {
         Self { overlays, signature: None }
     }
 
     /// Returns a reference to the overlays of this [`OverlayTable`].
-    pub fn overlays(&self) -> &[Overlay<'a>] {
+    pub fn overlays(&self) -> &[Overlay] {
         &self.overlays
     }
 
@@ -38,7 +37,7 @@ impl<'a> OverlayTable<'a> {
     /// # Errors
     ///
     /// See [`Overlay::parse_arm9`].
-    pub fn parse_arm9(raw: raw::OverlayTable, rom: &'a raw::Rom, arm9: &Arm9) -> Result<Self, OverlayError> {
+    pub fn parse_arm9(raw: raw::OverlayTable, rom: &raw::Rom, arm9: &Arm9) -> Result<Self, OverlayError> {
         let overlays =
             raw.overlays().iter().map(|overlay| Overlay::parse_arm9(overlay, rom, arm9)).collect::<Result<Vec<_>, _>>()?;
         let signature = raw.signature();
@@ -50,7 +49,7 @@ impl<'a> OverlayTable<'a> {
     /// # Errors
     ///
     /// See [`Overlay::parse_arm7`].
-    pub fn parse_arm7(raw: raw::OverlayTable, rom: &'a raw::Rom) -> Result<Self, OverlayError> {
+    pub fn parse_arm7(raw: raw::OverlayTable, rom: &raw::Rom) -> Result<Self, OverlayError> {
         let overlays =
             raw.overlays().iter().map(|overlay| Overlay::parse_arm7(overlay, rom)).collect::<Result<Vec<_>, _>>()?;
         let signature = raw.signature();

@@ -3,8 +3,8 @@ use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 
 /// ARM7 program.
-pub struct Arm7<'a> {
-    data: Cow<'a, [u8]>,
+pub struct Arm7 {
+    data: Vec<u8>,
     offsets: Arm7Offsets,
 }
 
@@ -21,9 +21,9 @@ pub struct Arm7Offsets {
     pub autoload_callback: u32,
 }
 
-impl<'a> Arm7<'a> {
+impl Arm7 {
     /// Creates a new ARM7 program from raw data.
-    pub fn new<T: Into<Cow<'a, [u8]>>>(data: T, offsets: Arm7Offsets) -> Self {
+    pub fn new<T: Into<Vec<u8>>>(data: T, offsets: Arm7Offsets) -> Self {
         Self { data: data.into(), offsets }
     }
 

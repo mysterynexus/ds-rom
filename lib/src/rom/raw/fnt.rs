@@ -12,9 +12,9 @@ use super::RawHeaderError;
 
 /// File Name Table or FNT for short. Contains the names of every file and directory in the ROM. This is the raw struct, see
 /// the plain one [here](super::super::Files).
-pub struct Fnt<'a> {
+pub struct Fnt {
     /// Every directory has one subtable, indexed by `dir_id & 0xfff`
-    pub subtables: Box<[FntSubtable<'a>]>,
+    pub subtables: Box<[FntSubtable]>,
 }
 
 /// A directory entry in the FNT's directory list.
@@ -31,11 +31,11 @@ pub struct FntDirectory {
 }
 
 /// Contains a directory's immediate children (files and folders).
-pub struct FntSubtable<'a> {
+pub struct FntSubtable {
     /// Reference to [`FntDirectory`].
-    pub directory: Cow<'a, FntDirectory>,
+    pub directory: FntDirectory,
     /// Raw subtable data.
-    pub data: Cow<'a, [u8]>,
+    pub data: Vec<u8>,
 }
 
 /// Errors related to [`Fnt`].
@@ -65,7 +65,7 @@ pub enum RawFntError {
     },
 }
 
-impl<'a> Fnt<'a> {
+impl Fnt {
     fn check_size(data: &'_ [u8]) -> Result<(), RawFntError> {
         let size = size_of::<FntDirectory>();
         if data.len() < size {
@@ -90,7 +90,7 @@ impl<'a> Fnt<'a> {
     /// # Errors
     ///
     /// This function will return an error if the input is too small or not aligned enough.
-    pub fn borrow_from_slice(data: &'a [u8]) -> Result<Self, RawFntError> {
+    pub fn borrow_from_slice(data: &[u8]) -> Result<Self, RawFntError> {
         Self::check_size(data)?;
         let addr = data as *const [u8] as *const () as usize;
         if addr % 4 != 0 {
@@ -107,7 +107,7 @@ impl<'a> Fnt<'a> {
         let mut subtables = Vec::with_capacity(directories.len());
         for directory in directories {
             let start = directory.subtable_offset as usize;
-            subtables.push(FntSubtable { directory: Cow::Borrowed(directory), data: Cow::Borrowed(&data[start..]) });
+            subtables.push(FntSubtable { directory: *directory, data: data[start..].to_vec() });
         }
 
         Ok(Self { subtables: subtables.into_boxed_slice() })
@@ -126,12 +126,12 @@ impl<'a> Fnt<'a> {
 
         if let Some(root) = self.subtables.first_mut() {
             // the root entry has no parent, so `parent_id` is instead the number of directories
-            root.directory.to_mut().parent_id = num_directories;
+            root.directory.parent_id = num_directories;
         }
 
         for subtable in self.subtables.iter_mut() {
-            subtable.directory.to_mut().subtable_offset = subtable_offset;
-            bytes.write_all(bytemuck::bytes_of(subtable.directory.as_ref()))?;
+            subtable.directory.subtable_offset = subtable_offset;
+            bytes.write_all(bytemuck::bytes_of(&subtable.directory))?;
             subtable_offset += subtable.data.len() as u32 + 1; // +1 for 0-byte terminator, see loop below
         }
 
@@ -144,7 +144,7 @@ impl<'a> Fnt<'a> {
     }
 }
 
-impl FntSubtable<'_> {
+impl FntSubtable {
     /// Returns an iterator over all immediate children (files and directories) in this subtable.
     pub fn iter(&self) -> IterFntSubtable {
         IterFntSubtable { data: &self.data, id: self.directory.first_file_id }

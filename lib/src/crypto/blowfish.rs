@@ -160,6 +160,7 @@ pub enum BlowfishLevel {
 }
 
 /// A base key used for [`Blowfish`].
+#[derive(Clone)]
 pub struct BlowfishKey([u8; 0x1048]);
 
 /// Errors related to [`BlowfishKey`].

@@ -14,11 +14,11 @@ use crate::{
 
 /// An overlay module for ARM9/ARM7.
 #[derive(Clone)]
-pub struct Overlay<'a> {
+pub struct Overlay {
     originally_compressed: bool,
     info: OverlayInfo,
     signature: Option<HmacSha1Signature>,
-    data: Cow<'a, [u8]>,
+    data: Vec<u8>,
 }
 
 const LZ77: Lz77 = Lz77 {};
@@ -72,9 +72,9 @@ pub enum OverlayError {
     },
 }
 
-impl<'a> Overlay<'a> {
+impl Overlay {
     /// Creates a new [`Overlay`] from plain data.
-    pub fn new<T: Into<Cow<'a, [u8]>>>(data: T, options: OverlayOptions) -> Result<Self, OverlayError> {
+    pub fn new<T: Into<Vec<u8>>>(data: T, options: OverlayOptions) -> Result<Self, OverlayError> {
         let OverlayOptions { originally_compressed, info } = options;
         let data = data.into();
 
@@ -86,7 +86,7 @@ impl<'a> Overlay<'a> {
     /// # Errors
     ///
     /// This function will return an error if the overlay is signed and the ARM9 program does not contain overlay signatures.
-    pub fn parse_arm9(overlay: &raw::Overlay, rom: &'a raw::Rom, arm9: &Arm9) -> Result<Self, OverlayError> {
+    pub fn parse_arm9(overlay: &raw::Overlay, rom: &raw::Rom, arm9: &Arm9) -> Result<Self, OverlayError> {
         let fat = rom.fat()?;
 
         let alloc = fat[overlay.file_id as usize];
@@ -103,7 +103,7 @@ impl<'a> Overlay<'a> {
             originally_compressed: overlay.flags.is_compressed(),
             info: OverlayInfo::new(overlay),
             signature,
-            data: Cow::Borrowed(data),
+            data: data.to_vec(),
         };
 
         Ok(overlay)
@@ -114,7 +114,7 @@ impl<'a> Overlay<'a> {
     /// # Errors
     ///
     /// This function will return an error if the overlay is signed, as ARM7 overlay signatures are not supported.
-    pub fn parse_arm7(overlay: &raw::Overlay, rom: &'a raw::Rom) -> Result<Self, OverlayError> {
+    pub fn parse_arm7(overlay: &raw::Overlay, rom: &raw::Rom) -> Result<Self, OverlayError> {
         let fat = rom.fat()?;
 
         let alloc = fat[overlay.file_id as usize];
@@ -128,7 +128,7 @@ impl<'a> Overlay<'a> {
             originally_compressed: overlay.flags.is_compressed(),
             info: OverlayInfo::new(overlay),
             signature: None,
-            data: Cow::Borrowed(data),
+            data: data.to_vec(),
         };
 
         Ok(overlay)

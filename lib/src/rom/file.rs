@@ -3,7 +3,7 @@ use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashSet},
     fmt::Display,
-    io::Write,
+    io::{Cursor, Write},
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -18,9 +18,10 @@ use crate::{
 };
 
 /// Contains files and directories to be placed into a ROM.
-pub struct FileSystem<'a> {
+#[derive(Clone)]
+pub struct FileSystem {
     num_overlays: usize,
-    files: Vec<File<'a>>,
+    files: Vec<File>,
     dirs: Vec<Dir>,
     next_file_id: u16,
     next_dir_id: u16,
@@ -28,11 +29,11 @@ pub struct FileSystem<'a> {
 
 /// A file for the [`FileSystem`] struct.
 #[derive(Clone)]
-pub struct File<'a> {
+pub struct File {
     id: u16,
     name: String,
     original_offset: u32,
-    contents: Cow<'a, [u8]>,
+    contents: Vec<u8>,
 }
 
 /// A directory for the [`FileSystem`] struct.
@@ -86,7 +87,7 @@ pub enum FileBuildError {
 
 const ROOT_DIR_ID: u16 = 0xf000;
 
-impl<'a> FileSystem<'a> {
+impl FileSystem {
     /// Creates a new [`FileSystem`]. The number of overlays are used to determine the first file ID, since overlays are also
     /// located in the FAT but not the FNT.
     pub fn new(num_overlays: usize) -> Self {
@@ -164,10 +165,10 @@ impl<'a> FileSystem<'a> {
     fn parse_subtable(
         fnt: &Fnt,
         fat: &[FileAlloc],
-        rom: &'a raw::Rom,
+        rom: &raw::Rom,
         parent: &mut Dir,
         dirs: &mut Vec<Option<Dir>>,
-        files: &mut Vec<Option<File<'a>>>,
+        files: &mut Vec<Option<File>>,
     ) -> (u16, u16) {
         let subtable_index = parent.id as usize & 0xfff;
         let subtable = &fnt.subtables[subtable_index];
@@ -190,7 +191,7 @@ impl<'a> FileSystem<'a> {
                 max_file_id = max_file_id.max(id);
                 let alloc = fat[id as usize];
                 let contents = &rom.data()[alloc.range()];
-                files[id as usize] = Some(File { id, name, original_offset: alloc.start, contents: Cow::Borrowed(contents) });
+                files[id as usize] = Some(File { id, name, original_offset: alloc.start, contents: contents.to_vec() });
                 parent.children.push(id);
             }
         }
@@ -203,7 +204,7 @@ impl<'a> FileSystem<'a> {
     ///
     /// This function will return an error if [`raw::Rom::num_arm9_overlays`] or [`raw::Rom::num_arm7_overlays`] fails, or if
     /// a file or directory ID is missing from the FNT.
-    pub fn parse(fnt: &Fnt, fat: &[FileAlloc], rom: &'a raw::Rom) -> Result<Self, FileParseError> {
+    pub fn parse(fnt: &Fnt, fat: &[FileAlloc], rom: &raw::Rom) -> Result<Self, FileParseError> {
         let num_overlays = rom.num_arm9_overlays()? + rom.num_arm7_overlays()?;
 
         let mut root = Dir { id: ROOT_DIR_ID, name: "/".to_string(), parent_id: 0, children: vec![] };
@@ -261,17 +262,17 @@ impl<'a> FileSystem<'a> {
         }
 
         Ok(FntSubtable {
-            directory: Cow::Owned(FntDirectory {
+            directory: FntDirectory {
                 subtable_offset: 0,
                 first_file_id: self.find_first_file_id(parent),
                 parent_id: parent.parent_id,
-            }),
-            data: Cow::Owned(data),
+            },
+            data,
         })
     }
 
-    fn build_fnt_recursive(&'a self, subtables: &mut Vec<FntSubtable<'a>>, parent_id: u16) -> Result<(), FileBuildError> {
-        let parent = &self.dir(parent_id);
+    fn build_fnt_recursive(&self, subtables: &mut Vec<FntSubtable>, parent_id: u16) -> Result<(), FileBuildError> {
+        let parent = self.dir(parent_id);
         subtables.push(self.build_subtable(parent)?);
         for child in &parent.children {
             if Self::is_dir(*child) {
@@ -393,9 +394,16 @@ impl<'a> FileSystem<'a> {
         self.files.last().unwrap()
     }
 
-    async fn traverse_nonvisited_files<Cb>(&self, visited: &mut HashSet<u16>, callback: &mut Cb, subdir: &Dir, path: &Path)
-    where
-        Cb: AsyncFnMut(&File, &Path),
+    async fn traverse_nonvisited_files<Cb>(
+        &self,
+        visited: &mut HashSet<u16>,
+        callback: &mut Cb,
+        subdir: &Dir,
+        path: PathBuf,
+        cursor: &mut Cursor<Vec<u8>>,
+        fat: &mut Vec<FileAlloc>,
+    ) where
+        Cb: AsyncFnMut(&File, PathBuf, &mut Cursor<Vec<u8>>, &mut Vec<FileAlloc>),
     {
         if visited.contains(&subdir.id) {
             return;
@@ -407,9 +415,9 @@ impl<'a> FileSystem<'a> {
 
             if Self::is_dir(*child) {
                 let path = path.join(self.name(*child));
-                Box::pin(self.traverse_nonvisited_files(visited, callback, self.dir(*child), &path)).await;
+                Box::pin(self.traverse_nonvisited_files(visited, callback, self.dir(*child), path.clone(), cursor, fat)).await;
             } else {
-                callback(self.file(*child), path).await;
+                callback(self.file(*child), path.clone(), cursor, fat).await;
                 let first_time_visiting_file = visited.insert(*child);
                 assert!(first_time_visiting_file);
             }
@@ -420,16 +428,21 @@ impl<'a> FileSystem<'a> {
 
     /// Traverses the [`FileSystem`] and calls `callback` for each file found. The directories will be prioritized according to
     /// the `path_order`.
-    pub async fn traverse_files<I, Cb>(&self, path_order: I, mut callback: Cb)
-    where
-        I: IntoIterator<Item = &'a str>,
-        Cb: AsyncFnMut(&File, &Path),
+    pub async fn traverse_files<I, Cb>(
+        &self,
+        cursor: &mut Cursor<Vec<u8>>,
+        fat: &mut Vec<FileAlloc>,
+        path_order: I,
+        mut callback: Cb,
+    ) where
+        I: IntoIterator<Item = String>,
+        Cb: AsyncFnMut(&File, PathBuf, &mut Cursor<Vec<u8>>, &mut Vec<FileAlloc>),
     {
         let mut visited = HashSet::<u16>::new();
 
         for path in path_order {
-            let path = path.strip_prefix("/").unwrap_or(path);
-            let path_buf = &PathBuf::from_str(path).unwrap();
+            let path = path.strip_prefix("/").unwrap_or(&path);
+            let path_buf = PathBuf::from_str(path).unwrap();
             let subdir = if path.trim() == "" {
                 self.dir(ROOT_DIR_ID)
             } else {
@@ -442,13 +455,13 @@ impl<'a> FileSystem<'a> {
                     self.dir(child)
                 } else {
                     let file = self.file(child);
-                    callback(file, path_buf).await;
+                    callback(file, path_buf, cursor, fat).await;
                     let first_time_visiting_file = visited.insert(file.id);
                     assert!(first_time_visiting_file);
                     continue;
                 }
             };
-            self.traverse_nonvisited_files(&mut visited, &mut callback, subdir, path_buf).await;
+            self.traverse_nonvisited_files(&mut visited, &mut callback, subdir, path_buf, cursor, fat).await;
         }
     }
 
@@ -471,7 +484,7 @@ impl<'a> FileSystem<'a> {
 
     /// Creates a [`DisplayFileSystem`] which implements [`Display`].
     pub fn display(&self, indent: usize) -> DisplayFileSystem {
-        DisplayFileSystem { files: self, parent_id: ROOT_DIR_ID, indent }
+        DisplayFileSystem { files: self.clone(), parent_id: ROOT_DIR_ID, indent }
     }
 
     fn traverse_and_compute_path_order(&self, path: &str, path_order: &mut BinaryHeap<PathOrder>, parent: &Dir) {
@@ -550,7 +563,7 @@ impl<'a> FileSystem<'a> {
     }
 }
 
-impl File<'_> {
+impl File {
     /// Returns a reference to the name of this [`File`].
     pub fn name(&self) -> &str {
         &self.name
@@ -595,13 +608,13 @@ impl Ord for PathOrder {
 }
 
 /// Can be used to display the file hierarchy of a [`FileSystem`].
-pub struct DisplayFileSystem<'a> {
-    files: &'a FileSystem<'a>,
+pub struct DisplayFileSystem {
+    files: FileSystem,
     parent_id: u16,
     indent: usize,
 }
 
-impl Display for DisplayFileSystem<'_> {
+impl Display for DisplayFileSystem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let i = " ".repeat(self.indent);
         let parent = self.files.dir(self.parent_id);
@@ -610,7 +623,7 @@ impl Display for DisplayFileSystem<'_> {
             if FileSystem::is_dir(*child) {
                 write!(f, "{i}0x{:04x}: {: <32}", *child, files.name(*child))?;
                 writeln!(f)?;
-                write!(f, "{}", Self { files, parent_id: *child, indent: self.indent + 2 })?;
+                write!(f, "{}", Self { files: files.clone(), parent_id: *child, indent: self.indent + 2 })?;
             } else {
                 let file = files.file(*child);
                 let size = BlobSize(file.contents.len()).to_string();

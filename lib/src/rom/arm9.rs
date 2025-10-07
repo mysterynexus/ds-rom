@@ -18,8 +18,8 @@ use crate::{
 
 /// ARM9 program.
 #[derive(Clone)]
-pub struct Arm9<'a> {
-    data: Cow<'a, [u8]>,
+pub struct Arm9 {
+    data: Vec<u8>,
     offsets: Arm9Offsets,
     originally_compressed: bool,
     originally_encrypted: bool,
@@ -171,9 +171,9 @@ pub struct Arm9WithTcmsOptions {
     pub originally_encrypted: bool,
 }
 
-impl<'a> Arm9<'a> {
+impl Arm9 {
     /// Creates a new ARM9 program from raw data.
-    pub fn new<T: Into<Cow<'a, [u8]>>>(data: T, offsets: Arm9Offsets) -> Result<Self, RawBuildInfoError> {
+    pub fn new<T: Into<Vec<u8>>>(data: T, offsets: Arm9Offsets) -> Result<Self, RawBuildInfoError> {
         let mut arm9 = Arm9 { data: data.into(), offsets, originally_compressed: false, originally_encrypted: false };
         arm9.originally_compressed = arm9.is_compressed()?;
         arm9.originally_encrypted = arm9.is_encrypted();
@@ -281,7 +281,7 @@ impl<'a> Arm9<'a> {
         }
 
         secure_area[0..8].copy_from_slice(&SECURE_AREA_ID);
-        self.data.to_mut()[0..0x4000].copy_from_slice(&secure_area);
+        self.data[0..0x4000].copy_from_slice(&secure_area);
         Ok(())
     }
 
@@ -305,7 +305,7 @@ impl<'a> Arm9<'a> {
         }
 
         let secure_area = self.encrypted_secure_area(key, gamecode);
-        self.data.to_mut()[0..0x4000].copy_from_slice(&secure_area);
+        self.data[0..0x4000].copy_from_slice(&secure_area);
         Ok(())
     }
 
@@ -349,7 +349,7 @@ impl<'a> Arm9<'a> {
     ///
     /// See [`BuildInfo::borrow_from_slice_mut`].
     pub fn build_info_mut(&mut self) -> Result<&mut BuildInfo, RawBuildInfoError> {
-        BuildInfo::borrow_from_slice_mut(&mut self.data.to_mut()[self.offsets.build_info as usize..])
+        BuildInfo::borrow_from_slice_mut(&mut self.data[self.offsets.build_info as usize..])
     }
 
     /// Returns whether this ARM9 program is compressed. See [`Self::originally_compressed`] for whether the program was
@@ -372,7 +372,7 @@ impl<'a> Arm9<'a> {
             return Ok(());
         }
 
-        let data: Cow<[u8]> = LZ77.decompress(&self.data)?.into_vec().into();
+        let data: Vec<u8> = LZ77.decompress(&self.data)?.into_vec();
         let old_data = replace(&mut self.data, data);
         let build_info = match self.build_info_mut() {
             Ok(build_info) => build_info,
@@ -395,7 +395,7 @@ impl<'a> Arm9<'a> {
             return Ok(());
         }
 
-        let data: Cow<[u8]> = LZ77.compress(&self.data, COMPRESSION_START)?.into_vec().into();
+        let data: Vec<u8> = LZ77.compress(&self.data, COMPRESSION_START)?.into_vec();
         let length = data.len();
         let old_data = replace(&mut self.data, data);
         let base_address = self.base_address();
@@ -535,7 +535,7 @@ impl<'a> Arm9<'a> {
         let Some(range) = self.overlay_table_signature_range()? else {
             return Ok(None);
         };
-        let data = &mut self.data.to_mut()[range];
+        let data = &mut self.data[range];
 
         let signature = HmacSha1Signature::borrow_from_slice_mut(data)?;
         Ok(Some(signature.first_mut().unwrap()))
@@ -585,7 +585,7 @@ impl<'a> Arm9<'a> {
         let Some(range) = self.overlay_signatures_range(num_overlays)? else {
             return Ok(None);
         };
-        let data = &mut self.data.to_mut()[range];
+        let data = &mut self.data[range];
         Ok(Some(HmacSha1Signature::borrow_from_slice_mut(data)?))
     }
 
@@ -685,7 +685,7 @@ impl<'a> Arm9<'a> {
     }
 }
 
-impl AsRef<[u8]> for Arm9<'_> {
+impl AsRef<[u8]> for Arm9 {
     fn as_ref(&self) -> &[u8] {
         &self.data
     }
