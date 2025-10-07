@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use fusio::{disk::AsyncFs, error::Error as FusioError, fs::OpenOptions, path::Path as FusioPath, Fs, Read, Write};
+use fusio::{error::Error as FusioError, fs::OpenOptions, path::Path as FusioPath, Fs, Read, Write};
 use futures::StreamExt;
 use image::{
     codecs::png::PngEncoder, DynamicImage, EncodableLayout, ExtendedColorType, GrayImage, ImageEncoder, ImageError,
@@ -14,9 +14,14 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_yml::Error as SerdeYmlError;
 use snafu::{ResultExt, Snafu};
 
-pub type FsImpl = AsyncFs;
-
-static FS: FsImpl = FsImpl {};
+#[cfg(not(target_arch = "wasm32"))]
+type FsImpl = fusio::disk::AsyncFs;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) static FS: fusio::disk::AsyncFs = fusio::disk::AsyncFs;
+#[cfg(target_arch = "wasm32")]
+type FsImpl = fusio::disk::OPFS;
+#[cfg(target_arch = "wasm32")]
+pub(crate) static FS: fusio::disk::OPFS = fusio::disk::OPFS;
 
 #[derive(Debug, Snafu)]
 pub enum FileError {
@@ -44,7 +49,7 @@ pub enum FileError {
 
 /// Wrapper for [`AsyncFs::open_options`] with clearer errors.
 pub async fn open_file<P: AsRef<Path>>(path: P) -> Result<<FsImpl as Fs>::File, FileError> {
-    let fusio_path = FusioPath::from_filesystem_path(path.as_ref())?;
+    let fusio_path = FusioPath::new(path.as_ref())?;
     let options = OpenOptions::default();
 
     match FS.open_options(&fusio_path, options).await {
@@ -58,7 +63,7 @@ pub async fn open_file<P: AsRef<Path>>(path: P) -> Result<<FsImpl as Fs>::File, 
 
 /// Wrapper for [`AsyncFs::open_options`] with clearer errors when creating files.
 pub async fn create_file<P: AsRef<Path>>(path: P) -> Result<<FsImpl as Fs>::File, FileError> {
-    let fusio_path = FusioPath::from_filesystem_path(path.as_ref())?;
+    let fusio_path = FusioPath::new(path.as_ref())?;
     let options = OpenOptions::default().create(true).write(true).truncate(true);
 
     match FS.open_options(&fusio_path, options).await {
@@ -104,7 +109,7 @@ pub async fn read_file<P: AsRef<Path>>(path: P) -> Result<Vec<u8>, FileError> {
 
 /// Wrapper for [`Fs::open_options`] with clearer errors when writing files.
 pub async fn write_file<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> Result<(), FileError> {
-    let fusio_path = FusioPath::from_filesystem_path(path.as_ref())?;
+    let fusio_path = FusioPath::new(path.as_ref())?;
     let options = OpenOptions::default().create(true).truncate(true).write(true);
 
     let mut file = match FS.open_options(&fusio_path, options).await {
@@ -150,7 +155,7 @@ pub async fn read_to_string<P: AsRef<Path>>(path: P) -> Result<String, FileError
 
 /// Wrapper for [`Fs::list`] with clearer errors.
 pub async fn read_dir<P: AsRef<Path>>(path: P) -> Result<Vec<std::path::PathBuf>, FileError> {
-    let fusio_path = FusioPath::from_filesystem_path(path.as_ref())?;
+    let fusio_path = FusioPath::new(path.as_ref())?;
 
     let stream = FS.list(&fusio_path).await.map_err(|err| match err {
         FusioError::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
@@ -182,7 +187,7 @@ pub async fn read_dir<P: AsRef<Path>>(path: P) -> Result<Vec<std::path::PathBuf>
 
 /// Wrapper for [`AsyncFs::create_dir_all`] with clearer errors.
 pub async fn create_dir_all<P: AsRef<Path>>(path: P) -> Result<(), FileError> {
-    let fusio_path = FusioPath::from_filesystem_path(path.as_ref())?;
+    let fusio_path = FusioPath::new(path.as_ref())?;
     FsImpl::create_dir_all(&fusio_path).await.context(FsSnafu { path: path.as_ref() })?;
     Ok(())
 }
