@@ -493,6 +493,7 @@ dependencies = [
 [[package]]
 name = "fusio"
 version = "0.4.1"
+source = "git+https://github.com/bitdriftr/fusio?branch=asyncfs#a15c39b18929f7926ac156fabb776f7f7464242f"
 dependencies = [
  "async-fs",
  "async-lock",
@@ -513,6 +514,7 @@ dependencies = [
 [[package]]
 name = "fusio-core"
 version = "0.4.1"
+source = "git+https://github.com/bitdriftr/fusio?branch=asyncfs#a15c39b18929f7926ac156fabb776f7f7464242f"
 dependencies = [
  "bytes",
  "thiserror",
