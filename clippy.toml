@@ -24,6 +24,7 @@ disallowed-methods = [
   { path = "std::fs::DirBuilder::new", reason = "not available on wasm" },
 
   { path = "std::path::Path::exists", reason = "not available on wasm" },
+  { path = "std::path::Path::is_dir", reason = "not available on wasm" },
 
   # { path = "std::sync::Mutex::new", reason = "not available on wasm" },
   { path = "std::sync::RwLock::new", reason = "not available on wasm" },

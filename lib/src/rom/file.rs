@@ -98,12 +98,13 @@ impl FileSystem {
         // Sort children by FNT order so the file/dir IDs become correct
         let mut children = read_dir(&path).await?;
         children.sort_unstable_by(|a, b| {
-            Self::compare_for_fnt(a.to_string_lossy().as_ref(), a.is_dir(), b.to_string_lossy().as_ref(), b.is_dir())
+            Self::compare_for_fnt(a.to_string_lossy().as_ref(), false, b.to_string_lossy().as_ref(), false)
         });
 
         for child in children.into_iter() {
             let name = child.file_name().unwrap().to_string_lossy().to_string();
-            if child.is_dir() {
+
+            if read_dir(&child).await.is_ok() {
                 let child_id = self.next_dir_id;
                 let child_path = path.as_ref().join(&name);
                 self.make_child_dir(name, parent_id);
