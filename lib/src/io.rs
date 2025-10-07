@@ -1,10 +1,15 @@
 use std::{
     backtrace::Backtrace,
+    io::{BufWriter, Cursor},
     path::{Path, PathBuf},
 };
 
 use fusio::{disk::AsyncFs, error::Error as FusioError, fs::OpenOptions, path::Path as FusioPath, Fs, Read, Write};
 use futures::StreamExt;
+use image::{
+    codecs::png::PngEncoder, DynamicImage, EncodableLayout, ExtendedColorType, GrayImage, ImageEncoder, ImageError,
+    ImageFormat, RgbaImage,
+};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_yml::Error as SerdeYmlError;
 use snafu::{ResultExt, Snafu};
@@ -31,6 +36,10 @@ pub enum FileError {
     Fs { path: PathBuf, source: FusioError, backtrace: Backtrace },
     #[snafu(transparent)]
     Path { source: fusio::path::Error, backtrace: Backtrace },
+    #[snafu(display("unsupported image format for '{path:?}':\n{backtrace}"))]
+    UnsupportedImageFormat { path: PathBuf, backtrace: Backtrace },
+    #[snafu(display("failed to decode image '{path:?}': {source}"))]
+    ImageDecode { path: PathBuf, source: ImageError, backtrace: Backtrace },
 }
 
 /// Wrapper for [`AsyncFs::open_options`] with clearer errors.
@@ -198,8 +207,39 @@ where
     let mut serialized = Vec::new();
     serde_yml::to_writer(&mut serialized, value)?;
     let (result, _) = writer.write_all(serialized).await;
+    writer.flush().await.unwrap();
+    writer.close().await.unwrap();
     match result {
         Ok(()) => Ok(()),
         Err(err) => panic!("write_yaml failed: {}", err),
     }
+}
+
+pub async fn read_image(path: &Path) -> Result<DynamicImage, FileError> {
+    let data = read_file(path).await?;
+    let ext = path.extension().and_then(|ext| ext.to_str()).unwrap();
+    let format = ImageFormat::from_extension(ext).unwrap();
+    let image = image::load(Cursor::new(data), format).context(ImageDecodeSnafu { path: path.to_path_buf() })?;
+    Ok(image)
+}
+
+pub async fn write_rgba_image(image: &RgbaImage, path: &Path) -> Result<(), FileError> {
+    write_raw_image(image.as_bytes(), image.width(), image.height(), path, ExtendedColorType::Rgba8).await
+}
+
+pub async fn write_gray_image(image: &GrayImage, path: &Path) -> Result<(), FileError> {
+    write_raw_image(image.as_bytes(), image.width(), image.height(), path, ExtendedColorType::L8).await
+}
+
+async fn write_raw_image(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    path: &Path,
+    color_type: ExtendedColorType,
+) -> Result<(), FileError> {
+    let mut buffer = BufWriter::new(Vec::new());
+    PngEncoder::new(&mut buffer).write_image(data, width, height, color_type).unwrap();
+    write_file(path, &buffer.into_inner().unwrap()).await?;
+    Ok(())
 }

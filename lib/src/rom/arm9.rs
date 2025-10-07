@@ -1,4 +1,4 @@
-use std::{borrow::Cow, io, mem::replace, ops::Range};
+use std::{io, mem::replace, ops::Range};
 
 use serde::{Deserialize, Serialize};
 use snafu::{Backtrace, Snafu};
@@ -202,7 +202,7 @@ impl Arm9 {
         let autoload_infos_end = data.len() as u32 + offsets.base_address;
 
         let Arm9WithTcmsOptions { originally_compressed, originally_encrypted } = options;
-        let mut arm9 = Self { data: data.into(), offsets, originally_compressed, originally_encrypted };
+        let mut arm9 = Self { data, offsets, originally_compressed, originally_encrypted };
 
         let build_info = arm9.build_info_mut()?;
         build_info.autoload_blocks = autoload_blocks;
@@ -236,7 +236,7 @@ impl Arm9 {
         let autoload_infos_end = data.len() as u32 + offsets.base_address;
 
         let Arm9WithTcmsOptions { originally_compressed, originally_encrypted } = options;
-        let mut arm9 = Self { data: data.into(), offsets, originally_compressed, originally_encrypted };
+        let mut arm9 = Self { data, offsets, originally_compressed, originally_encrypted };
 
         let build_info = arm9.build_info_mut()?;
         build_info.autoload_blocks = autoload_blocks;

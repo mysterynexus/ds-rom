@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     cmp::Ordering,
     collections::{BinaryHeap, HashSet},
     fmt::Display,
@@ -108,7 +107,7 @@ impl FileSystem {
                 let child_id = self.next_dir_id;
                 let child_path = path.as_ref().join(&name);
                 self.make_child_dir(name, parent_id);
-                self.load_in(child_path, child_id).await?;
+                Box::pin(self.load_in(child_path, child_id)).await?;
             } else {
                 let contents = read_file(child).await?;
                 self.make_child_file(name, parent_id, contents);
@@ -387,7 +386,7 @@ impl FileSystem {
 
     fn make_child_file(&mut self, name: String, parent_id: u16, contents: Vec<u8>) -> &File {
         let id = self.next_file_id;
-        self.files.push(File { id, name, original_offset: 0, contents: contents.into() });
+        self.files.push(File { id, name, original_offset: 0, contents });
         let parent = self.dir_mut(parent_id);
         parent.children.push(id);
         self.next_file_id += 1;

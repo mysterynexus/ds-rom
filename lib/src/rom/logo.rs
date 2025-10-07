@@ -1,9 +1,12 @@
 use std::{fmt::Display, io, path::Path};
 
-use image::{io::Reader, GenericImageView, GrayImage, ImageError, Luma};
+use image::{GenericImageView, GrayImage, ImageError, Luma};
 use snafu::{Backtrace, Snafu};
 
-use crate::compress::huffman::{NibbleHuffman, NibbleHuffmanCode};
+use crate::{
+    compress::huffman::{NibbleHuffman, NibbleHuffmanCode},
+    io::{read_image, write_gray_image},
+};
 
 /// Huffman codes for every combination of 4 pixels
 const HUFFMAN: NibbleHuffman = NibbleHuffman {
@@ -157,7 +160,7 @@ impl Logo {
     /// # Errors
     ///
     /// This function will return an error if [`GrayImage::save`] fails.
-    pub fn save_png<P: AsRef<Path>>(&self, path: P) -> Result<(), LogoSaveError> {
+    pub async fn save_png<P: AsRef<Path>>(&self, path: P) -> Result<(), LogoSaveError> {
         let mut image = GrayImage::new(WIDTH as u32, HEIGHT as u32);
         for y in 0..HEIGHT {
             for x in 0..WIDTH {
@@ -165,7 +168,8 @@ impl Logo {
                 image.put_pixel(x as u32, y as u32, Luma([luma]));
             }
         }
-        image.save(path)?;
+
+        write_gray_image(&image, path.as_ref()).await.unwrap();
         Ok(())
     }
 
@@ -174,8 +178,8 @@ impl Logo {
     /// # Errors
     ///
     /// This function will return an error if it failed to open or decode the image, or the image has the wrong size or colors.
-    pub fn from_png<P: AsRef<Path>>(path: P) -> Result<Self, LogoLoadError> {
-        let image = Reader::open(path)?.decode()?;
+    pub async fn from_png<P: AsRef<Path>>(path: P) -> Result<Self, LogoLoadError> {
+        let image = read_image(path.as_ref()).await.unwrap();
         if image.width() != WIDTH as u32 || image.height() != HEIGHT as u32 {
             ImageSizeSnafu {
                 expected: ImageSize { width: WIDTH as u32, height: HEIGHT as u32 },
@@ -322,10 +326,10 @@ impl Logo {
     }
 }
 
-/// Braille patterns indexed as binary representations of 0-255. Bit positions:  
-/// 6 7  
-/// 4 5  
-/// 3 2  
+/// Braille patterns indexed as binary representations of 0-255. Bit positions:
+/// 6 7
+/// 4 5
+/// 3 2
 /// 1 0
 const BRAILLE: &[char; 256] = &[
     '⠀', '⢀', '⡀', '⣀', '⠠', '⢠', '⡠', '⣠', '⠄', '⢄', '⡄', '⣄', '⠤', '⢤', '⡤', '⣤', '⠐', '⢐', '⡐', '⣐', '⠰', '⢰', '⡰', '⣰',

@@ -1,4 +1,4 @@
-use std::{backtrace::Backtrace, borrow::Cow, io};
+use std::{backtrace::Backtrace, io};
 
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
@@ -211,7 +211,7 @@ impl Overlay {
         if !self.is_compressed() {
             return Ok(());
         }
-        self.data = LZ77.decompress(&self.data)?.into_vec().into();
+        self.data = LZ77.decompress(&self.data)?.into_vec();
         self.info.compressed = false;
         Ok(())
     }
@@ -225,7 +225,7 @@ impl Overlay {
         if self.is_compressed() {
             return Ok(());
         }
-        self.data = LZ77.compress(&self.data, 0)?.into_vec().into();
+        self.data = LZ77.compress(&self.data, 0)?.into_vec();
         self.info.compressed = true;
         Ok(())
     }

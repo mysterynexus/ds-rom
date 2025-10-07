@@ -2,9 +2,10 @@
 
 #![feature(error_generic_member_access)]
 #![warn(missing_docs)]
-#![expect(dead_code)]
-#![expect(mismatched_lifetime_syntaxes)]
+#![warn(clippy::disallowed_methods)]
 #![expect(clippy::manual_is_multiple_of)]
+#![allow(dead_code)]
+#![allow(mismatched_lifetime_syntaxes)]
 
 /// Compression algorithms.
 pub mod compress;

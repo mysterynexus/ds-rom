@@ -334,7 +334,7 @@ impl Rom {
         let (header, header_logo) = if options.load_header {
             let mut header_reader = open_file(path.join(&config.header)).await?;
             let header: Header = read_yaml(&mut header_reader).await?;
-            let header_logo = Logo::from_png(path.join(&config.header_logo))?;
+            let header_logo = Logo::from_png(path.join(&config.header_logo)).await?;
             (header, header_logo)
         } else {
             Default::default()
@@ -423,7 +423,7 @@ impl Rom {
             let banner_dir = banner_path.parent().unwrap();
             let mut banner_reader = open_file(&banner_path).await?;
             let mut banner: Banner = read_yaml(&mut banner_reader).await?;
-            banner.images.load(banner_dir)?;
+            banner.images.load(banner_dir).await?;
             banner
         } else {
             Default::default()
@@ -522,7 +522,7 @@ impl Rom {
         // --------------------- Save header ---------------------
         let mut header_writer = create_file_and_dirs(path.join(&self.config.header)).await?;
         write_yaml(&mut header_writer, &self.header).await?;
-        self.header_logo.save_png(path.join(&self.config.header_logo))?;
+        self.header_logo.save_png(path.join(&self.config.header_logo)).await?;
 
         // --------------------- Save ARM9 program ---------------------
         let arm9_build_config = self.arm9_build_config()?;
@@ -540,12 +540,18 @@ impl Rom {
             log::info!("Decompressing ARM9 program");
             plain_arm9.decompress()?;
         }
-        create_file_and_dirs(path.join(&self.config.arm9_bin)).await?.write_all(plain_arm9.code()?).await.0?;
+        let mut file = create_file_and_dirs(path.join(&self.config.arm9_bin)).await?;
+        file.write_all(plain_arm9.code()?).await.0?;
+        file.flush().await?;
+        file.close().await?;
 
         // --------------------- Save ARM9 HMAC-SHA1 key ---------------------
         if let Some(arm9_hmac_sha1_key) = plain_arm9.hmac_sha1_key()? {
             if let Some(key_file) = &self.config.arm9_hmac_sha1_key {
-                create_file_and_dirs(path.join(key_file)).await?.write_all(arm9_hmac_sha1_key.as_ref()).await.0?;
+                let mut file = create_file_and_dirs(path.join(key_file)).await?;
+                file.write_all(arm9_hmac_sha1_key.as_ref()).await.0?;
+                file.flush().await?;
+                file.close().await?;
             }
         } else if self.config.arm9_hmac_sha1_key.is_some() {
             log::warn!("ARM9 HMAC-SHA1 key not found, but config requested it to be saved");
@@ -566,7 +572,11 @@ impl Rom {
                     (path.join(&unknown_autoload.files.bin), path.join(&unknown_autoload.files.config))
                 }
             };
-            create_file_and_dirs(bin_path).await?.write_all(autoload.code()).await.0?;
+            let mut file = create_file_and_dirs(bin_path).await?;
+            file.write_all(autoload.code()).await.0?;
+            file.flush().await?;
+            file.close().await?;
+
             let mut autoload_writer = create_file_and_dirs(config_path).await?;
             write_yaml(&mut autoload_writer, autoload.info()).await?;
         }
@@ -577,7 +587,11 @@ impl Rom {
         }
 
         // --------------------- Save ARM7 program ---------------------
-        create_file_and_dirs(path.join(&self.config.arm7_bin)).await?.write_all(self.arm7.full_data()).await.0?;
+        let mut file = create_file_and_dirs(path.join(&self.config.arm7_bin)).await?;
+        file.write_all(self.arm7.full_data()).await.0?;
+        file.flush().await?;
+        file.close().await?;
+
         let mut arm7_config_writer = create_file_and_dirs(path.join(&self.config.arm7_config)).await?;
         write_yaml(&mut arm7_config_writer, self.arm7.offsets()).await?;
 
@@ -592,7 +606,7 @@ impl Rom {
             let banner_dir = banner_path.parent().unwrap();
             let mut banner_writer = create_file_and_dirs(&banner_path).await?;
             write_yaml(&mut banner_writer, &self.banner).await?;
-            self.banner.images.save_bitmap_file(banner_dir)?;
+            self.banner.images.save_bitmap_file(banner_dir).await?;
         }
 
         // --------------------- Save files ---------------------
@@ -603,14 +617,17 @@ impl Rom {
                 .traverse_files(&mut Cursor::default(), &mut vec![], ["/".into()], async move |file, path, _, _| {
                     let path = files_path.join(path);
                     // TODO: Rewrite traverse_files as an iterator so these errors can be returned
+
+                    // println!("{:?}", path.join(file.name()));
+                    if path.join(file.name()).display().to_string().contains("d00p01.bma") {
+                        println!("Saving file: {} with length {:?}", path.display(), file.contents().len());
+                    }
+
                     create_dir_all(&path).await.expect("failed to create file directory");
-                    create_file(path.join(file.name()))
-                        .await
-                        .expect("failed to create file")
-                        .write_all(file.contents())
-                        .await
-                        .0
-                        .expect("failed to write file");
+                    let mut out_file = create_file(path.join(file.name())).await.expect("failed to create file");
+                    out_file.write_all(file.contents()).await.0.expect("failed to write file");
+                    out_file.flush().await.unwrap();
+                    out_file.close().await.unwrap();
                 })
                 .await;
         }
@@ -620,11 +637,14 @@ impl Rom {
             path_order_file.write_all(path.as_bytes()).await.0?;
             path_order_file.write_all("\n".as_bytes()).await.0?;
         }
+        path_order_file.flush().await.unwrap();
+        path_order_file.close().await.unwrap();
 
         Ok(())
     }
 
     /// Generates a build config for ARM9, which normally goes into arm9.yaml.
+    #[allow(clippy::result_large_err)]
     pub fn arm9_build_config(&self) -> Result<Arm9BuildConfig, RomSaveError> {
         Ok(Arm9BuildConfig {
             offsets: *self.arm9.offsets(),
@@ -655,7 +675,10 @@ impl Rom {
                     log::info!("Decompressing {processor} overlay {}/{}", overlay.id(), overlays.len() - 1);
                     plain_overlay.decompress()?;
                 }
-                create_file(overlays_path.join(format!("{name}.bin"))).await?.write_all(plain_overlay.code()).await.0?;
+                let mut file = create_file(overlays_path.join(format!("{name}.bin"))).await?;
+                file.write_all(plain_overlay.code()).await.0?;
+                file.flush().await?;
+                file.close().await?;
             }
 
             let overlay_table_config = OverlayTableConfig {

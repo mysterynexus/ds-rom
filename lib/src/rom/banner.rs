@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use image::{io::Reader, GenericImageView, ImageError, Rgba, RgbaImage};
+use image::{GenericImageView, ImageError, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
 use snafu::{Backtrace, Snafu};
 
@@ -11,7 +11,11 @@ use super::{
     raw::{self, BannerBitmap, BannerPalette, BannerVersion, Language},
     ImageSize,
 };
-use crate::{crc::CRC_16_MODBUS, str::Unicode16Array};
+use crate::{
+    crc::CRC_16_MODBUS,
+    io::{read_image, write_rgba_image},
+    str::Unicode16Array,
+};
 
 /// ROM banner.
 #[derive(Serialize, Deserialize, Default)]
@@ -217,8 +221,8 @@ impl BannerImages {
     ///
     /// This function will return an error if [`Reader::open`] or [`Reader::decode`] fails, or if the images are the wrong
     /// size, or the bitmap has a color not present in the palette.
-    pub fn load(&mut self, path: &Path) -> Result<(), BannerImageError> {
-        let bitmap_image = Reader::open(path.join(&self.bitmap_path))?.decode()?;
+    pub async fn load(&mut self, path: &Path) -> Result<(), BannerImageError> {
+        let bitmap_image = read_image(&path.join(&self.bitmap_path)).await.unwrap();
         if bitmap_image.width() != 32 || bitmap_image.height() != 32 {
             return WrongSizeSnafu {
                 expected: ImageSize { width: 32, height: 32 },
@@ -227,7 +231,7 @@ impl BannerImages {
             .fail();
         }
 
-        let palette_image = Reader::open(path.join(&self.palette_path))?.decode()?;
+        let palette_image = read_image(&path.join(&self.palette_path)).await.unwrap();
         if palette_image.width() != 16 || palette_image.height() != 1 {
             return WrongSizeSnafu {
                 expected: ImageSize { width: 16, height: 1 },
@@ -266,7 +270,7 @@ impl BannerImages {
     /// # Errors
     ///
     /// See [`RgbImage::save`].
-    pub fn save_bitmap_file(&self, path: &Path) -> Result<(), BannerImageError> {
+    pub async fn save_bitmap_file(&self, path: &Path) -> Result<(), BannerImageError> {
         let mut bitmap_image = RgbaImage::new(32, 32);
         for y in 0..32 {
             for x in 0..32 {
@@ -282,8 +286,9 @@ impl BannerImages {
             palette_image.put_pixel(index as u32, 0, Rgba(color));
         }
 
-        bitmap_image.save(path.join(&self.bitmap_path))?;
-        palette_image.save(path.join(&self.palette_path))?;
+        write_rgba_image(&bitmap_image, &path.join(&self.bitmap_path)).await.unwrap();
+        write_rgba_image(&palette_image, &path.join(&self.palette_path)).await.unwrap();
+
         Ok(())
     }
 }
