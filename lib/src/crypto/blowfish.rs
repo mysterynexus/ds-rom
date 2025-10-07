@@ -1,13 +1,9 @@
-use std::{
-    io::{self, Read, Seek, SeekFrom},
-    mem::size_of,
-    path::Path,
-};
+use std::{io, mem::size_of, path::Path};
 
 use bytemuck::{Pod, Zeroable};
 use snafu::{Backtrace, Snafu};
 
-use crate::io::{open_file, FileError};
+use crate::io::{read_file, FileError};
 
 /// De/encrypts data using the [Blowfish](https://en.wikipedia.org/wiki/Blowfish_(cipher)) block cipher.
 #[repr(C)]
@@ -199,16 +195,16 @@ impl BlowfishKey {
     /// # Errors
     ///
     /// This function will return an error if the file is too small to contain a Blowfish key.
-    pub fn from_arm7_bios_path<P: AsRef<Path>>(path: P) -> Result<Self, BlowfishKeyError> {
-        let mut file = open_file(path)?;
-        let size = file.metadata()?.len() as usize;
+    pub async fn from_arm7_bios_path<P: AsRef<Path>>(path: P) -> Result<Self, BlowfishKeyError> {
+        let path_ref = path.as_ref();
+        let data = read_file(path_ref).await?;
+        let size = data.len();
         if size < 0x30 + size_of::<Self>() {
             return TooSmallSnafu { expected: 0x30 + size_of::<Self>(), actual: size }.fail();
         }
 
         let mut key = [0; size_of::<Self>()];
-        file.seek(SeekFrom::Start(0x30))?;
-        file.read_exact(&mut key)?;
+        key.copy_from_slice(&data[0x30..0x30 + size_of::<Self>()]);
 
         Ok(Self(key))
     }

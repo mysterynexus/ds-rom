@@ -94,10 +94,9 @@ impl<'a> FileSystem<'a> {
         Self { num_overlays, files: vec![], dirs: vec![root], next_file_id: num_overlays as u16, next_dir_id: ROOT_DIR_ID + 1 }
     }
 
-    fn load_in<P: AsRef<Path>>(&mut self, path: P, parent_id: u16) -> Result<(), FileError> {
+    async fn load_in<P: AsRef<Path>>(&mut self, path: P, parent_id: u16) -> Result<(), FileError> {
         // Sort children by FNT order so the file/dir IDs become correct
-        let mut children =
-            read_dir(&path)?.collect::<Result<Vec<_>, _>>()?.into_iter().map(|entry| entry.path()).collect::<Vec<_>>();
+        let mut children = read_dir(&path).await?;
         children.sort_unstable_by(|a, b| {
             Self::compare_for_fnt(a.to_string_lossy().as_ref(), a.is_dir(), b.to_string_lossy().as_ref(), b.is_dir())
         });
@@ -108,9 +107,9 @@ impl<'a> FileSystem<'a> {
                 let child_id = self.next_dir_id;
                 let child_path = path.as_ref().join(&name);
                 self.make_child_dir(name, parent_id);
-                self.load_in(child_path, child_id)?;
+                self.load_in(child_path, child_id).await?;
             } else {
-                let contents = read_file(child)?;
+                let contents = read_file(child).await?;
                 self.make_child_file(name, parent_id, contents);
             }
         }
@@ -123,9 +122,9 @@ impl<'a> FileSystem<'a> {
     /// # Errors
     ///
     /// This function will return an error if an I/O operation fails.
-    pub fn load<P: AsRef<Path>>(root: P, num_overlays: usize) -> Result<Self, FileError> {
+    pub async fn load<P: AsRef<Path>>(root: P, num_overlays: usize) -> Result<Self, FileError> {
         let mut files = Self::new(num_overlays);
-        files.load_in(root, ROOT_DIR_ID)?;
+        files.load_in(root, ROOT_DIR_ID).await?;
         Ok(files)
     }
 
@@ -394,9 +393,9 @@ impl<'a> FileSystem<'a> {
         self.files.last().unwrap()
     }
 
-    fn traverse_nonvisited_files<Cb>(&self, visited: &mut HashSet<u16>, callback: &mut Cb, subdir: &Dir, path: &Path)
+    async fn traverse_nonvisited_files<Cb>(&self, visited: &mut HashSet<u16>, callback: &mut Cb, subdir: &Dir, path: &Path)
     where
-        Cb: FnMut(&File, &Path),
+        Cb: AsyncFnMut(&File, &Path),
     {
         if visited.contains(&subdir.id) {
             return;
@@ -408,9 +407,9 @@ impl<'a> FileSystem<'a> {
 
             if Self::is_dir(*child) {
                 let path = path.join(self.name(*child));
-                self.traverse_nonvisited_files(visited, callback, self.dir(*child), &path);
+                Box::pin(self.traverse_nonvisited_files(visited, callback, self.dir(*child), &path)).await;
             } else {
-                callback(self.file(*child), path);
+                callback(self.file(*child), path).await;
                 let first_time_visiting_file = visited.insert(*child);
                 assert!(first_time_visiting_file);
             }
@@ -421,10 +420,10 @@ impl<'a> FileSystem<'a> {
 
     /// Traverses the [`FileSystem`] and calls `callback` for each file found. The directories will be prioritized according to
     /// the `path_order`.
-    pub fn traverse_files<I, Cb>(&self, path_order: I, mut callback: Cb)
+    pub async fn traverse_files<I, Cb>(&self, path_order: I, mut callback: Cb)
     where
         I: IntoIterator<Item = &'a str>,
-        Cb: FnMut(&File, &Path),
+        Cb: AsyncFnMut(&File, &Path),
     {
         let mut visited = HashSet::<u16>::new();
 
@@ -443,13 +442,13 @@ impl<'a> FileSystem<'a> {
                     self.dir(child)
                 } else {
                     let file = self.file(child);
-                    callback(file, path_buf);
+                    callback(file, path_buf).await;
                     let first_time_visiting_file = visited.insert(file.id);
                     assert!(first_time_visiting_file);
                     continue;
                 }
             };
-            self.traverse_nonvisited_files(&mut visited, &mut callback, subdir, path_buf);
+            self.traverse_nonvisited_files(&mut visited, &mut callback, subdir, path_buf).await;
         }
     }
 

@@ -1,146 +1,205 @@
 use std::{
     backtrace::Backtrace,
-    fs::{self, File, ReadDir},
-    io,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
-use snafu::Snafu;
+use fusio::{disk::AsyncFs, error::Error as FusioError, fs::OpenOptions, path::Path as FusioPath, Fs, Read, Write};
+use futures::StreamExt;
+use serde::{de::DeserializeOwned, Serialize};
+use serde_yml::Error as SerdeYmlError;
+use snafu::{ResultExt, Snafu};
+
+pub type FsImpl = AsyncFs;
+
+static FS: FsImpl = FsImpl {};
 
 #[derive(Debug, Snafu)]
 pub enum FileError {
+    #[snafu(display("the file '{path:?}' was not found:\n{backtrace}"))]
+    FileNotFound { path: PathBuf, backtrace: Backtrace },
+    #[snafu(display("parent directory does not exist for file '{path:?}':\n{backtrace}"))]
+    FileParentNotFound { path: PathBuf, backtrace: Backtrace },
+    #[snafu(display("the directory '{path:?}' was not found:\n{backtrace}"))]
+    DirNotFound { path: PathBuf, backtrace: Backtrace },
+    #[snafu(display("failed to read file '{path:?}', ran out of memory:\n{backtrace}"))]
+    FileOutOfMemory { path: PathBuf, backtrace: Backtrace },
+    #[snafu(display("failed to read directory '{path:?}', ran out of memory:\n{backtrace}"))]
+    DirOutOfMemory { path: PathBuf, backtrace: Backtrace },
+    #[snafu(display("the file '{path:?}' already exists:\n{backtrace}"))]
+    AlreadyExists { path: PathBuf, backtrace: Backtrace },
+    #[snafu(display("filesystem error for '{path:?}': {source}"))]
+    Fs { path: PathBuf, source: FusioError, backtrace: Backtrace },
     #[snafu(transparent)]
-    Io { source: io::Error },
-    #[snafu(display("the file '{path}' was not found:\n{backtrace}"))]
-    FileNotFound { path: String, backtrace: Backtrace },
-    #[snafu(display("parent directory does not exist for file '{path}':\n{backtrace}"))]
-    FileParentNotFound { path: String, backtrace: Backtrace },
-    #[snafu(display("the directory '{path}' was not found:\n{backtrace}"))]
-    DirNotFound { path: String, backtrace: Backtrace },
-    #[snafu(display("failed to read file '{path}', ran out of memory:\n{backtrace}"))]
-    FileOutOfMemory { path: String, backtrace: Backtrace },
-    #[snafu(display("failed to read file '{path}', ran out of memory:\n{backtrace}"))]
-    DirOutOfMemory { path: String, backtrace: Backtrace },
-    #[snafu(display("the file '{path}' already exists:\n{backtrace}"))]
-    AlreadyExists { path: String, backtrace: Backtrace },
+    Path { source: fusio::path::Error, backtrace: Backtrace },
 }
 
-/// Wrapper for [`File::open`] with clearer errors.
-pub fn open_file<P: AsRef<Path>>(path: P) -> Result<File, FileError> {
-    let path = path.as_ref();
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(err) => {
-            let path = path.to_string_lossy();
-            match err.kind() {
-                io::ErrorKind::NotFound => return FileNotFoundSnafu { path }.fail(),
-                _ => Err(err)?,
-            }
+/// Wrapper for [`AsyncFs::open_options`] with clearer errors.
+pub async fn open_file<P: AsRef<Path>>(path: P) -> Result<<FsImpl as Fs>::File, FileError> {
+    let fusio_path = FusioPath::from_filesystem_path(path.as_ref())?;
+    let options = OpenOptions::default();
+
+    match FS.open_options(&fusio_path, options).await {
+        Ok(file) => Ok(file),
+        Err(FusioError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            FileNotFoundSnafu { path: path.as_ref() }.fail()
         }
-    };
-    Ok(file)
+        err => err.context(FsSnafu { path: path.as_ref() }),
+    }
 }
 
-/// Wrapper for [`File::create`] with clearer errors.
-pub fn create_file<P: AsRef<Path>>(path: P) -> Result<File, FileError> {
-    let path = path.as_ref();
-    let file = match File::create(path) {
-        Ok(file) => file,
-        Err(err) => {
-            let path = path.to_string_lossy();
-            match err.kind() {
-                io::ErrorKind::AlreadyExists => return AlreadyExistsSnafu { path }.fail(),
-                io::ErrorKind::NotFound => return FileParentNotFoundSnafu { path }.fail(),
-                _ => Err(err)?,
-            }
+/// Wrapper for [`AsyncFs::open_options`] with clearer errors when creating files.
+pub async fn create_file<P: AsRef<Path>>(path: P) -> Result<<FsImpl as Fs>::File, FileError> {
+    let fusio_path = FusioPath::from_filesystem_path(path.as_ref())?;
+    let options = OpenOptions::default().create(true).write(true).truncate(true);
+
+    match FS.open_options(&fusio_path, options).await {
+        Ok(file) => Ok(file),
+        Err(FusioError::Io(err)) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            AlreadyExistsSnafu { path: path.as_ref() }.fail()
         }
-    };
-    Ok(file)
+        Err(FusioError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            FileParentNotFoundSnafu { path: path.as_ref() }.fail()
+        }
+        err => err.context(FsSnafu { path: path.as_ref() }),
+    }
 }
 
 /// Creates a file using [`create_file`] and its parent directories using [`create_dir_all`].
-pub fn create_file_and_dirs<P: AsRef<Path>>(path: P) -> Result<File, FileError> {
-    let path = path.as_ref();
-    create_dir_all(path.parent().unwrap())?;
-    create_file(path)
+pub async fn create_file_and_dirs<P: AsRef<Path>>(path: P) -> Result<<FsImpl as Fs>::File, FileError> {
+    let path_ref = path.as_ref();
+
+    if let Some(parent) = path_ref.parent() {
+        create_dir_all(parent).await?;
+    }
+
+    create_file(path_ref).await
 }
 
-/// Wrapper for [`fs::read`] with clearer errors.
-pub fn read_file<P: AsRef<Path>>(path: P) -> Result<Vec<u8>, FileError> {
-    let path = path.as_ref();
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            let path = path.to_string_lossy();
-            match err.kind() {
-                io::ErrorKind::NotFound => return FileNotFoundSnafu { path }.fail(),
-                io::ErrorKind::OutOfMemory => return FileOutOfMemorySnafu { path }.fail(),
-                _ => todo!(),
-            }
+/// Wrapper for [`async_fs::read`] with clearer errors.
+pub async fn read_file<P: AsRef<Path>>(path: P) -> Result<Vec<u8>, FileError> {
+    let mut file = open_file(path.as_ref()).await?;
+    let (result, buf) = file.read_to_end_at(Vec::new(), 0).await;
+
+    if let Err(FusioError::Io(err)) = result.as_ref() {
+        if err.kind() == std::io::ErrorKind::OutOfMemory {
+            return FileOutOfMemorySnafu { path: path.as_ref() }.fail();
         }
-    };
-    Ok(bytes)
-}
-
-/// Wrapper for [`fs::write`] with clearer errors.
-pub fn write_file<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> Result<(), FileError> {
-    let path = path.as_ref();
-    let contents = contents.as_ref();
-    match fs::write(path, contents) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let path = path.to_string_lossy();
-            match err.kind() {
-                io::ErrorKind::AlreadyExists => AlreadyExistsSnafu { path }.fail(),
-                _ => Err(err)?,
-            }
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return FileNotFoundSnafu { path: path.as_ref() }.fail();
         }
     }
+
+    result.context(FsSnafu { path: path.as_ref() })?;
+    Ok(buf)
 }
 
-/// Wrapper for [`fs::read_to_string`] with clearer errors.
-pub fn read_to_string<P: AsRef<Path>>(path: P) -> Result<String, FileError> {
-    let path = path.as_ref();
-    let string = match fs::read_to_string(path) {
-        Ok(string) => string,
-        Err(err) => {
-            let path = path.to_string_lossy();
-            match err.kind() {
-                io::ErrorKind::NotFound => return FileNotFoundSnafu { path }.fail(),
-                io::ErrorKind::OutOfMemory => return FileOutOfMemorySnafu { path }.fail(),
-                _ => Err(err)?,
-            }
+/// Wrapper for [`Fs::open_options`] with clearer errors when writing files.
+pub async fn write_file<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> Result<(), FileError> {
+    let fusio_path = FusioPath::from_filesystem_path(path.as_ref())?;
+    let options = OpenOptions::default().create(true).truncate(true).write(true);
+
+    let mut file = match FS.open_options(&fusio_path, options).await {
+        Ok(file) => file,
+        Err(FusioError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            return FileParentNotFoundSnafu { path: path.as_ref() }.fail();
         }
+        Err(err) => return Err(err).context(FsSnafu { path: path.as_ref() }),
     };
-    Ok(string)
-}
 
-/// Wrapper for [`fs::read_dir`] with clearer errors.
-pub fn read_dir<P: AsRef<Path>>(path: P) -> Result<ReadDir, FileError> {
-    let path = path.as_ref();
-    let dir = match fs::read_dir(path) {
-        Ok(dir) => dir,
-        Err(err) => {
-            let path = path.to_string_lossy();
-            match err.kind() {
-                io::ErrorKind::NotFound => return DirNotFoundSnafu { path }.fail(),
-                io::ErrorKind::OutOfMemory => return DirOutOfMemorySnafu { path }.fail(),
-                _ => Err(err)?,
-            }
-        }
-    };
-    Ok(dir)
-}
-
-/// Wrapper for [`fs::create_dir_all`] with clearer errors.
-pub fn create_dir_all<P: AsRef<Path>>(path: P) -> Result<(), FileError> {
-    let path = path.as_ref();
-    if let Err(err) = fs::create_dir_all(path) {
-        let path = path.to_string_lossy();
-        match err.kind() {
-            io::ErrorKind::NotFound => return DirNotFoundSnafu { path }.fail(),
-            _ => Err(err)?,
+    let buffer = contents.as_ref();
+    let (result, _) = file.write_all(buffer).await;
+    if let Err(FusioError::Io(err)) = result.as_ref() {
+        if err.kind() == std::io::ErrorKind::OutOfMemory {
+            return FileOutOfMemorySnafu { path: path.as_ref() }.fail();
         }
     }
+
+    result.context(FsSnafu { path: path.as_ref() })?;
+    file.flush().await.context(FsSnafu { path: path.as_ref() })?;
+    file.close().await.context(FsSnafu { path: path.as_ref() })?;
+
     Ok(())
+}
+
+/// Wrapper for [`Fs::open_options`] with clearer errors.
+pub async fn read_to_string<P: AsRef<Path>>(path: P) -> Result<String, FileError> {
+    let mut file = open_file(path.as_ref()).await?;
+    let (result, buf) = file.read_to_end_at(Vec::new(), 0).await;
+
+    if let Err(FusioError::Io(err)) = result.as_ref() {
+        if err.kind() == std::io::ErrorKind::OutOfMemory {
+            return FileOutOfMemorySnafu { path: path.as_ref() }.fail();
+        }
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return FileNotFoundSnafu { path: path.as_ref() }.fail();
+        }
+    }
+
+    result.context(FsSnafu { path: path.as_ref() })?;
+    Ok(String::from_utf8(buf).unwrap())
+}
+
+/// Wrapper for [`Fs::list`] with clearer errors.
+pub async fn read_dir<P: AsRef<Path>>(path: P) -> Result<Vec<std::path::PathBuf>, FileError> {
+    let fusio_path = FusioPath::from_filesystem_path(path.as_ref())?;
+
+    let stream = FS.list(&fusio_path).await.map_err(|err| match err {
+        FusioError::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+            DirNotFoundSnafu { path: path.as_ref() }.build()
+        }
+        FusioError::Io(io_err) if io_err.kind() == std::io::ErrorKind::OutOfMemory => {
+            DirOutOfMemorySnafu { path: path.as_ref() }.build()
+        }
+        other => panic!("read_dir failed: {}", other),
+    })?;
+
+    futures::pin_mut!(stream);
+
+    let mut entries = Vec::new();
+    while let Some(next) = stream.next().await {
+        match next {
+            Ok(meta) => {
+                let entry_path = std::path::PathBuf::from(meta.path.as_ref());
+                entries.push(entry_path);
+            }
+            Err(error) => {
+                return Err(error).context(FsSnafu { path: path.as_ref() });
+            }
+        }
+    }
+
+    Ok(entries)
+}
+
+/// Wrapper for [`AsyncFs::create_dir_all`] with clearer errors.
+pub async fn create_dir_all<P: AsRef<Path>>(path: P) -> Result<(), FileError> {
+    let fusio_path = FusioPath::from_filesystem_path(path.as_ref())?;
+    FsImpl::create_dir_all(&fusio_path).await.context(FsSnafu { path: path.as_ref() })?;
+    Ok(())
+}
+
+pub async fn read_yaml<R, T>(reader: &mut R) -> Result<T, SerdeYmlError>
+where
+    R: Read,
+    T: DeserializeOwned,
+{
+    let (result, buf) = reader.read_to_end_at(Vec::new(), 0).await;
+    match result {
+        Ok(()) => serde_yml::from_slice(buf.as_slice()),
+        Err(err) => panic!("read_yaml failed: {}", err),
+    }
+}
+
+pub async fn write_yaml<W, T>(writer: &mut W, value: &T) -> Result<(), SerdeYmlError>
+where
+    W: Write,
+    T: Serialize,
+{
+    let mut serialized = Vec::new();
+    serde_yml::to_writer(&mut serialized, value)?;
+    let (result, _) = writer.write_all(serialized).await;
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) => panic!("write_yaml failed: {}", err),
+    }
 }

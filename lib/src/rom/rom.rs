@@ -5,6 +5,7 @@ use std::{
     path::Path,
 };
 
+use fusio::Write as _;
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
 
@@ -24,7 +25,10 @@ use crate::{
         blowfish::BlowfishKey,
         hmac_sha1::{HmacSha1, HmacSha1FromBytesError},
     },
-    io::{create_dir_all, create_file, create_file_and_dirs, open_file, read_file, read_to_string, FileError},
+    io::{
+        create_dir_all, create_file, create_file_and_dirs, open_file, read_file, read_to_string, read_yaml, write_yaml,
+        FileError,
+    },
     rom::{raw::FileAlloc, Arm9WithTcmsOptions, RomConfig},
 };
 
@@ -166,9 +170,15 @@ pub enum RomSaveError {
     /// Occurs when the ROM is encrypted but no Blowfish key was provided.
     #[snafu(display("blowfish key is required because ARM9 program is encrypted"))]
     BlowfishKeyNeeded,
-    /// See [`io::Error`].
+    /// See [`fusio::Error`].
     #[snafu(transparent)]
     Io {
+        /// Source error.
+        source: fusio::Error,
+    },
+    /// See [`io::Error`].
+    #[snafu(transparent)]
+    Compression {
         /// Source error.
         source: io::Error,
     },
@@ -312,16 +322,18 @@ impl<'a> Rom<'a> {
     /// # Errors
     ///
     /// This function will return an error if there's a file missing or the file has an invalid format.
-    pub fn load<P: AsRef<Path>>(config_path: P, options: RomLoadOptions) -> Result<Self, RomSaveError> {
+    pub async fn load<P: AsRef<Path>>(config_path: P, options: RomLoadOptions<'_>) -> Result<Self, RomSaveError> {
         let config_path = config_path.as_ref();
         log::info!("Loading ROM from {}", config_path.display());
 
-        let config: RomConfig = serde_yml::from_reader(open_file(config_path)?)?;
+        let mut config_reader = open_file(config_path).await?;
+        let config: RomConfig = read_yaml(&mut config_reader).await?;
         let path = config_path.parent().unwrap();
 
         // --------------------- Load header ---------------------
         let (header, header_logo) = if options.load_header {
-            let header: Header = serde_yml::from_reader(open_file(path.join(&config.header))?)?;
+            let mut header_reader = open_file(path.join(&config.header)).await?;
+            let header: Header = read_yaml(&mut header_reader).await?;
             let header_logo = Logo::from_png(path.join(&config.header_logo))?;
             (header, header_logo)
         } else {
@@ -329,25 +341,29 @@ impl<'a> Rom<'a> {
         };
 
         // --------------------- Load ARM9 program ---------------------
-        let arm9_build_config: Arm9BuildConfig = serde_yml::from_reader(open_file(path.join(&config.arm9_config))?)?;
-        let arm9 = read_file(path.join(&config.arm9_bin))?;
+        let mut arm9_config_reader = open_file(path.join(&config.arm9_config)).await?;
+        let arm9_build_config: Arm9BuildConfig = read_yaml(&mut arm9_config_reader).await?;
+        let arm9 = read_file(path.join(&config.arm9_bin)).await?;
 
         // --------------------- Load autoloads ---------------------
         let mut autoloads = vec![];
 
-        let itcm = read_file(path.join(&config.itcm.bin))?;
-        let itcm_info = serde_yml::from_reader(open_file(path.join(&config.itcm.config))?)?;
+        let itcm = read_file(path.join(&config.itcm.bin)).await?;
+        let mut itcm_reader = open_file(path.join(&config.itcm.config)).await?;
+        let itcm_info = read_yaml(&mut itcm_reader).await?;
         let itcm = Autoload::new(itcm, itcm_info);
         autoloads.push(itcm);
 
-        let dtcm = read_file(path.join(&config.dtcm.bin))?;
-        let dtcm_info = serde_yml::from_reader(open_file(path.join(&config.dtcm.config))?)?;
+        let dtcm = read_file(path.join(&config.dtcm.bin)).await?;
+        let mut dtcm_reader = open_file(path.join(&config.dtcm.config)).await?;
+        let dtcm_info = read_yaml(&mut dtcm_reader).await?;
         let dtcm = Autoload::new(dtcm, dtcm_info);
         autoloads.push(dtcm);
 
         for unknown_autoload in &config.unknown_autoloads {
-            let autoload = read_file(path.join(&unknown_autoload.files.bin))?;
-            let autoload_info = serde_yml::from_reader(open_file(path.join(&unknown_autoload.files.config))?)?;
+            let autoload = read_file(path.join(&unknown_autoload.files.bin)).await?;
+            let mut autoload_config_reader = open_file(path.join(&unknown_autoload.files.config)).await?;
+            let autoload_info = read_yaml(&mut autoload_config_reader).await?;
             let autoload = Autoload::new(autoload, autoload_info);
             autoloads.push(autoload);
         }
@@ -356,7 +372,7 @@ impl<'a> Rom<'a> {
 
         // --------------------- Load HMAC SHA1 key ---------------------
         let arm9_hmac_sha1 = if let Some(hmac_sha1_key_file) = &config.arm9_hmac_sha1_key {
-            let hmac_sha1_key = read_file(path.join(hmac_sha1_key_file))?;
+            let hmac_sha1_key = read_file(path.join(hmac_sha1_key_file)).await?;
             Some(HmacSha1::try_from(hmac_sha1_key.as_ref())?)
         } else {
             None
@@ -364,21 +380,16 @@ impl<'a> Rom<'a> {
 
         // --------------------- Load ARM9 overlays ---------------------
         let arm9_overlays = if let Some(arm9_overlays_config) = &config.arm9_overlays {
-            Self::load_overlays(&path.join(arm9_overlays_config), "arm9", arm9_hmac_sha1, &options)?
+            Self::load_overlays(&path.join(arm9_overlays_config), "arm9", arm9_hmac_sha1, &options).await?
         } else {
             Default::default()
         };
 
         // --------------------- Build ARM9 program ---------------------
-        let mut arm9 = Arm9::with_autoloads(
-            arm9,
-            &autoloads,
-            arm9_build_config.offsets,
-            Arm9WithTcmsOptions {
-                originally_compressed: arm9_build_config.compressed,
-                originally_encrypted: arm9_build_config.encrypted,
-            },
-        )?;
+        let mut arm9 = Arm9::with_autoloads(arm9, &autoloads, arm9_build_config.offsets, Arm9WithTcmsOptions {
+            originally_compressed: arm9_build_config.compressed,
+            originally_encrypted: arm9_build_config.encrypted,
+        })?;
         arm9_build_config.build_info.assign_to_raw(arm9.build_info_mut()?);
         arm9.update_overlay_signatures(&arm9_overlays)?;
         if arm9_build_config.compressed && options.compress {
@@ -395,21 +406,23 @@ impl<'a> Rom<'a> {
 
         // --------------------- Load ARM7 overlays ---------------------
         let arm7_overlays = if let Some(arm7_overlays_config) = &config.arm7_overlays {
-            Self::load_overlays(&path.join(arm7_overlays_config), "arm7", None, &options)?
+            Self::load_overlays(&path.join(arm7_overlays_config), "arm7", None, &options).await?
         } else {
             Default::default()
         };
 
         // --------------------- Load ARM7 program ---------------------
-        let arm7 = read_file(path.join(&config.arm7_bin))?;
-        let arm7_config = serde_yml::from_reader(open_file(path.join(&config.arm7_config))?)?;
+        let arm7 = read_file(path.join(&config.arm7_bin)).await?;
+        let mut arm7_config_reader = open_file(path.join(&config.arm7_config)).await?;
+        let arm7_config = read_yaml(&mut arm7_config_reader).await?;
         let arm7 = Arm7::new(arm7, arm7_config);
 
         // --------------------- Load banner ---------------------
         let banner = if options.load_banner {
             let banner_path = path.join(&config.banner);
             let banner_dir = banner_path.parent().unwrap();
-            let mut banner: Banner = serde_yml::from_reader(open_file(&banner_path)?)?;
+            let mut banner_reader = open_file(&banner_path).await?;
+            let mut banner: Banner = read_yaml(&mut banner_reader).await?;
             banner.images.load(banner_dir)?;
             banner
         } else {
@@ -420,9 +433,9 @@ impl<'a> Rom<'a> {
         let num_overlays = arm9_overlays.overlays().len() + arm7_overlays.overlays().len();
         let (files, path_order) = if options.load_files {
             log::info!("Loading ROM assets");
-            let files = FileSystem::load(path.join(&config.files_dir), num_overlays)?;
+            let files = FileSystem::load(path.join(&config.files_dir), num_overlays).await?;
             let path_order =
-                read_to_string(path.join(&config.path_order))?.trim().lines().map(|l| l.to_string()).collect::<Vec<_>>();
+                read_to_string(path.join(&config.path_order)).await?.trim().lines().map(|l| l.to_string()).collect::<Vec<_>>();
             (files, path_order)
         } else {
             (FileSystem::new(num_overlays), vec![])
@@ -442,18 +455,19 @@ impl<'a> Rom<'a> {
         })
     }
 
-    fn load_overlays(
+    async fn load_overlays(
         config_path: &Path,
         processor: &str,
         hmac_sha1: Option<HmacSha1>,
-        options: &RomLoadOptions,
+        options: &RomLoadOptions<'_>,
     ) -> Result<OverlayTable<'a>, RomSaveError> {
         let path = config_path.parent().unwrap();
         let mut overlays = vec![];
-        let overlay_table_config: OverlayTableConfig = serde_yml::from_reader(open_file(config_path)?)?;
+        let mut overlay_config_reader = open_file(config_path).await?;
+        let overlay_table_config: OverlayTableConfig = read_yaml(&mut overlay_config_reader).await?;
         let num_overlays = overlay_table_config.overlays.len();
         for mut config in overlay_table_config.overlays.into_iter() {
-            let data = read_file(path.join(config.file_name))?;
+            let data = read_file(path.join(config.file_name)).await?;
             let compressed = config.info.compressed;
             config.info.compressed = false;
             let mut overlay = Overlay::new(data, OverlayOptions { info: config.info, originally_compressed: compressed })?;
@@ -495,22 +509,25 @@ impl<'a> Rom<'a> {
     /// # Errors
     ///
     /// This function will return an error if a file could not be created or the a component of the ROM has an invalid format.
-    pub fn save<P: AsRef<Path>>(&self, path: P, key: Option<&BlowfishKey>) -> Result<(), RomSaveError> {
+    pub async fn save<P: AsRef<Path>>(&self, path: P, key: Option<&BlowfishKey>) -> Result<(), RomSaveError> {
         let path = path.as_ref();
-        create_dir_all(path)?;
+        create_dir_all(path).await?;
 
         log::info!("Saving ROM to directory {}", path.display());
 
         // --------------------- Save config ---------------------
-        serde_yml::to_writer(create_file_and_dirs(path.join("config.yaml"))?, &self.config)?;
+        let mut config_writer = create_file_and_dirs(path.join("config.yaml")).await?;
+        write_yaml(&mut config_writer, &self.config).await?;
 
         // --------------------- Save header ---------------------
-        serde_yml::to_writer(create_file_and_dirs(path.join(&self.config.header))?, &self.header)?;
+        let mut header_writer = create_file_and_dirs(path.join(&self.config.header)).await?;
+        write_yaml(&mut header_writer, &self.header).await?;
         self.header_logo.save_png(path.join(&self.config.header_logo))?;
 
         // --------------------- Save ARM9 program ---------------------
         let arm9_build_config = self.arm9_build_config()?;
-        serde_yml::to_writer(create_file_and_dirs(path.join(&self.config.arm9_config))?, &arm9_build_config)?;
+        let mut arm9_config_writer = create_file_and_dirs(path.join(&self.config.arm9_config)).await?;
+        write_yaml(&mut arm9_config_writer, &arm9_build_config).await?;
         let mut plain_arm9 = self.arm9.clone();
         if plain_arm9.is_encrypted() {
             let Some(key) = key else {
@@ -523,12 +540,12 @@ impl<'a> Rom<'a> {
             log::info!("Decompressing ARM9 program");
             plain_arm9.decompress()?;
         }
-        create_file_and_dirs(path.join(&self.config.arm9_bin))?.write_all(plain_arm9.code()?)?;
+        create_file_and_dirs(path.join(&self.config.arm9_bin)).await?.write_all(plain_arm9.code()?).await.0?;
 
         // --------------------- Save ARM9 HMAC-SHA1 key ---------------------
         if let Some(arm9_hmac_sha1_key) = plain_arm9.hmac_sha1_key()? {
             if let Some(key_file) = &self.config.arm9_hmac_sha1_key {
-                create_file_and_dirs(path.join(key_file))?.write_all(arm9_hmac_sha1_key.as_ref())?;
+                create_file_and_dirs(path.join(key_file)).await?.write_all(arm9_hmac_sha1_key.as_ref()).await.0?;
             }
         } else if self.config.arm9_hmac_sha1_key.is_some() {
             log::warn!("ARM9 HMAC-SHA1 key not found, but config requested it to be saved");
@@ -549,29 +566,32 @@ impl<'a> Rom<'a> {
                     (path.join(&unknown_autoload.files.bin), path.join(&unknown_autoload.files.config))
                 }
             };
-            create_file_and_dirs(bin_path)?.write_all(autoload.code())?;
-            serde_yml::to_writer(create_file_and_dirs(config_path)?, autoload.info())?;
+            create_file_and_dirs(bin_path).await?.write_all(autoload.code()).await.0?;
+            let mut autoload_writer = create_file_and_dirs(config_path).await?;
+            write_yaml(&mut autoload_writer, autoload.info()).await?;
         }
 
         // --------------------- Save ARM9 overlays ---------------------
         if let Some(arm9_overlays_config) = &self.config.arm9_overlays {
-            Self::save_overlays(&path.join(arm9_overlays_config), &self.arm9_overlay_table, "arm9")?;
+            Self::save_overlays(&path.join(arm9_overlays_config), &self.arm9_overlay_table, "arm9").await?;
         }
 
         // --------------------- Save ARM7 program ---------------------
-        create_file_and_dirs(path.join(&self.config.arm7_bin))?.write_all(self.arm7.full_data())?;
-        serde_yml::to_writer(create_file_and_dirs(path.join(&self.config.arm7_config))?, self.arm7.offsets())?;
+        create_file_and_dirs(path.join(&self.config.arm7_bin)).await?.write_all(self.arm7.full_data()).await.0?;
+        let mut arm7_config_writer = create_file_and_dirs(path.join(&self.config.arm7_config)).await?;
+        write_yaml(&mut arm7_config_writer, self.arm7.offsets()).await?;
 
         // --------------------- Save ARM7 overlays ---------------------
         if let Some(arm7_overlays_config) = &self.config.arm7_overlays {
-            Self::save_overlays(&path.join(arm7_overlays_config), &self.arm7_overlay_table, "arm7")?;
+            Self::save_overlays(&path.join(arm7_overlays_config), &self.arm7_overlay_table, "arm7").await?;
         }
 
         // --------------------- Save banner ---------------------
         {
             let banner_path = path.join(&self.config.banner);
             let banner_dir = banner_path.parent().unwrap();
-            serde_yml::to_writer(create_file_and_dirs(&banner_path)?, &self.banner)?;
+            let mut banner_writer = create_file_and_dirs(&banner_path).await?;
+            write_yaml(&mut banner_writer, &self.banner).await?;
             self.banner.images.save_bitmap_file(banner_dir)?;
         }
 
@@ -579,20 +599,26 @@ impl<'a> Rom<'a> {
         {
             log::info!("Saving ROM assets");
             let files_path = path.join(&self.config.files_dir);
-            self.files.traverse_files(["/"], |file, path| {
-                let path = files_path.join(path);
-                // TODO: Rewrite traverse_files as an iterator so these errors can be returned
-                create_dir_all(&path).expect("failed to create file directory");
-                create_file(path.join(file.name()))
-                    .expect("failed to create file")
-                    .write_all(file.contents())
-                    .expect("failed to write file");
-            });
+            self.files
+                .traverse_files(["/"], async move |file, path| {
+                    let path = files_path.join(path);
+                    // TODO: Rewrite traverse_files as an iterator so these errors can be returned
+                    create_dir_all(&path).await.expect("failed to create file directory");
+                    create_file(path.join(file.name()))
+                        .await
+                        .expect("failed to create file")
+                        .write_all(file.contents())
+                        .await
+                        .0
+                        .expect("failed to write file");
+                })
+                .await;
         }
-        let mut path_order_file = create_file_and_dirs(path.join(&self.config.path_order))?;
+
+        let mut path_order_file = create_file_and_dirs(path.join(&self.config.path_order)).await?;
         for path in &self.path_order {
-            path_order_file.write_all(path.as_bytes())?;
-            path_order_file.write_all("\n".as_bytes())?;
+            path_order_file.write_all(path.as_bytes()).await.0?;
+            path_order_file.write_all("\n".as_bytes()).await.0?;
         }
 
         Ok(())
@@ -608,11 +634,11 @@ impl<'a> Rom<'a> {
         })
     }
 
-    fn save_overlays(config_path: &Path, overlay_table: &OverlayTable, processor: &str) -> Result<(), RomSaveError> {
+    async fn save_overlays(config_path: &Path, overlay_table: &OverlayTable<'_>, processor: &str) -> Result<(), RomSaveError> {
         let overlays = overlay_table.overlays();
         if !overlays.is_empty() {
             let overlays_path = config_path.parent().unwrap();
-            create_dir_all(overlays_path)?;
+            create_dir_all(overlays_path).await?;
 
             let mut configs = vec![];
             for overlay in overlays {
@@ -629,7 +655,7 @@ impl<'a> Rom<'a> {
                     log::info!("Decompressing {processor} overlay {}/{}", overlay.id(), overlays.len() - 1);
                     plain_overlay.decompress()?;
                 }
-                create_file(overlays_path.join(format!("{name}.bin")))?.write_all(plain_overlay.code())?;
+                create_file(overlays_path.join(format!("{name}.bin"))).await?.write_all(plain_overlay.code()).await.0?;
             }
 
             let overlay_table_config = OverlayTableConfig {
@@ -637,7 +663,8 @@ impl<'a> Rom<'a> {
                 table_signature: overlay_table.signature(),
                 overlays: configs,
             };
-            serde_yml::to_writer(create_file(config_path)?, &overlay_table_config)?;
+            let mut overlay_writer = create_file(config_path).await?;
+            write_yaml(&mut overlay_writer, &overlay_table_config).await?;
         }
         Ok(())
     }
@@ -725,7 +752,7 @@ impl<'a> Rom<'a> {
     /// # Errors
     ///
     /// This function will return an error if an I/O operation fails or a component fails to build.
-    pub fn build(mut self, key: Option<&BlowfishKey>) -> Result<raw::Rom<'a>, RomBuildError> {
+    pub async fn build(mut self, key: Option<&BlowfishKey>) -> Result<raw::Rom<'a>, RomBuildError> {
         let mut context = BuildContext { blowfish_key: key, ..Default::default() };
 
         let mut cursor = Cursor::new(Vec::with_capacity(128 * 1024)); // smallest possible ROM
@@ -817,17 +844,19 @@ impl<'a> Rom<'a> {
         // --------------------- Write files ---------------------
         self.align_file_image(&mut cursor, self.config.alignment.file_image_block)?;
         self.files.sort_for_rom();
-        self.files.traverse_files(self.path_order.iter().map(|s| s.as_str()), |file, _| {
-            // TODO: Rewrite traverse_files as an iterator so these errors can be returned
-            self.align_file_image(&mut cursor, self.config.alignment.file).expect("failed to align after file");
+        self.files
+            .traverse_files(self.path_order.iter().map(|s| s.as_str()), async |file, _| {
+                // TODO: Rewrite traverse_files as an iterator so these errors can be returned
+                self.align_file_image(&mut cursor, self.config.alignment.file).expect("failed to align after file");
 
-            let contents = file.contents();
-            let start = cursor.position() as u32;
-            let end = start + contents.len() as u32;
-            file_allocs[file.id() as usize] = FileAlloc { start, end };
+                let contents = file.contents();
+                let start = cursor.position() as u32;
+                let end = start + contents.len() as u32;
+                file_allocs[file.id() as usize] = FileAlloc { start, end };
 
-            cursor.write_all(contents).expect("failed to write file contents");
-        });
+                cursor.write_all(contents).expect("failed to write file contents");
+            })
+            .await;
 
         // --------------------- Write padding ---------------------
         context.rom_size = Some(cursor.position() as u32);
