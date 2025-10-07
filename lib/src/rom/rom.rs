@@ -617,12 +617,6 @@ impl Rom {
                 .traverse_files(&mut Cursor::default(), &mut vec![], ["/".into()], async move |file, path, _, _| {
                     let path = files_path.join(path);
                     // TODO: Rewrite traverse_files as an iterator so these errors can be returned
-
-                    // println!("{:?}", path.join(file.name()));
-                    if path.join(file.name()).display().to_string().contains("d00p01.bma") {
-                        println!("Saving file: {} with length {:?}", path.display(), file.contents().len());
-                    }
-
                     create_dir_all(&path).await.expect("failed to create file directory");
                     let mut out_file = create_file(path.join(file.name())).await.expect("failed to create file");
                     out_file.write_all(file.contents()).await.0.expect("failed to write file");
