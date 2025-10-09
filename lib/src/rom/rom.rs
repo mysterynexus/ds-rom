@@ -5,7 +5,7 @@ use std::{
     path::Path,
 };
 
-use fusio::Write as _;
+use ezfs::FilesystemError;
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
 
@@ -170,17 +170,11 @@ pub enum RomSaveError {
     /// Occurs when the ROM is encrypted but no Blowfish key was provided.
     #[snafu(display("blowfish key is required because ARM9 program is encrypted"))]
     BlowfishKeyNeeded,
-    /// See [`fusio::Error`].
+    /// See [`io::Error`].
     #[snafu(transparent)]
     Io {
         /// Source error.
-        source: fusio::Error,
-    },
-    /// See [`io::Error`].
-    #[snafu(transparent)]
-    Compression {
-        /// Source error.
-        source: io::Error,
+        source: FilesystemError,
     },
     /// See [`FileError`].
     #[snafu(transparent)]
@@ -326,14 +320,14 @@ impl Rom {
         let config_path = config_path.as_ref();
         log::info!("Loading ROM from {}", config_path.display());
 
-        let mut config_reader = open_file(config_path).await?;
-        let config: RomConfig = read_yaml(&mut config_reader).await?;
+        let config_reader = open_file(config_path).await?;
+        let config: RomConfig = read_yaml(config_reader).await?;
         let path = config_path.parent().unwrap();
 
         // --------------------- Load header ---------------------
         let (header, header_logo) = if options.load_header {
-            let mut header_reader = open_file(path.join(&config.header)).await?;
-            let header: Header = read_yaml(&mut header_reader).await?;
+            let header_reader = open_file(path.join(&config.header)).await?;
+            let header: Header = read_yaml(header_reader).await?;
             let header_logo = Logo::from_png(path.join(&config.header_logo)).await?;
             (header, header_logo)
         } else {
@@ -341,29 +335,29 @@ impl Rom {
         };
 
         // --------------------- Load ARM9 program ---------------------
-        let mut arm9_config_reader = open_file(path.join(&config.arm9_config)).await?;
-        let arm9_build_config: Arm9BuildConfig = read_yaml(&mut arm9_config_reader).await?;
+        let arm9_config_reader = open_file(path.join(&config.arm9_config)).await?;
+        let arm9_build_config: Arm9BuildConfig = read_yaml(arm9_config_reader).await?;
         let arm9 = read_file(path.join(&config.arm9_bin)).await?;
 
         // --------------------- Load autoloads ---------------------
         let mut autoloads = vec![];
 
         let itcm = read_file(path.join(&config.itcm.bin)).await?;
-        let mut itcm_reader = open_file(path.join(&config.itcm.config)).await?;
-        let itcm_info = read_yaml(&mut itcm_reader).await?;
+        let itcm_reader = open_file(path.join(&config.itcm.config)).await?;
+        let itcm_info = read_yaml(itcm_reader).await?;
         let itcm = Autoload::new(itcm, itcm_info);
         autoloads.push(itcm);
 
         let dtcm = read_file(path.join(&config.dtcm.bin)).await?;
-        let mut dtcm_reader = open_file(path.join(&config.dtcm.config)).await?;
-        let dtcm_info = read_yaml(&mut dtcm_reader).await?;
+        let dtcm_reader = open_file(path.join(&config.dtcm.config)).await?;
+        let dtcm_info = read_yaml(dtcm_reader).await?;
         let dtcm = Autoload::new(dtcm, dtcm_info);
         autoloads.push(dtcm);
 
         for unknown_autoload in &config.unknown_autoloads {
             let autoload = read_file(path.join(&unknown_autoload.files.bin)).await?;
-            let mut autoload_config_reader = open_file(path.join(&unknown_autoload.files.config)).await?;
-            let autoload_info = read_yaml(&mut autoload_config_reader).await?;
+            let autoload_config_reader = open_file(path.join(&unknown_autoload.files.config)).await?;
+            let autoload_info = read_yaml(autoload_config_reader).await?;
             let autoload = Autoload::new(autoload, autoload_info);
             autoloads.push(autoload);
         }
@@ -413,16 +407,16 @@ impl Rom {
 
         // --------------------- Load ARM7 program ---------------------
         let arm7 = read_file(path.join(&config.arm7_bin)).await?;
-        let mut arm7_config_reader = open_file(path.join(&config.arm7_config)).await?;
-        let arm7_config = read_yaml(&mut arm7_config_reader).await?;
+        let arm7_config_reader = open_file(path.join(&config.arm7_config)).await?;
+        let arm7_config = read_yaml(arm7_config_reader).await?;
         let arm7 = Arm7::new(arm7, arm7_config);
 
         // --------------------- Load banner ---------------------
         let banner = if options.load_banner {
             let banner_path = path.join(&config.banner);
             let banner_dir = banner_path.parent().unwrap();
-            let mut banner_reader = open_file(&banner_path).await?;
-            let mut banner: Banner = read_yaml(&mut banner_reader).await?;
+            let banner_reader = open_file(&banner_path).await?;
+            let mut banner: Banner = read_yaml(banner_reader).await?;
             banner.images.load(banner_dir).await?;
             banner
         } else {
@@ -463,8 +457,8 @@ impl Rom {
     ) -> Result<OverlayTable, RomSaveError> {
         let path = config_path.parent().unwrap();
         let mut overlays = vec![];
-        let mut overlay_config_reader = open_file(config_path).await?;
-        let overlay_table_config: OverlayTableConfig = read_yaml(&mut overlay_config_reader).await?;
+        let overlay_config_reader = open_file(config_path).await?;
+        let overlay_table_config: OverlayTableConfig = read_yaml(overlay_config_reader).await?;
         let num_overlays = overlay_table_config.overlays.len();
         for mut config in overlay_table_config.overlays.into_iter() {
             let data = read_file(path.join(config.file_name)).await?;
@@ -475,7 +469,7 @@ impl Rom {
             if options.compress {
                 if compressed {
                     log::info!("Compressing {processor} overlay {}/{}", overlay.id(), num_overlays - 1);
-                    overlay.compress()?;
+                    overlay.compress().unwrap();
                 }
 
                 if config.signed {
@@ -541,17 +535,13 @@ impl Rom {
             plain_arm9.decompress()?;
         }
         let mut file = create_file_and_dirs(path.join(&self.config.arm9_bin)).await?;
-        file.write_all(plain_arm9.code()?).await.0?;
-        file.flush().await?;
-        file.close().await?;
+        file.write(plain_arm9.code()?).await?;
 
         // --------------------- Save ARM9 HMAC-SHA1 key ---------------------
         if let Some(arm9_hmac_sha1_key) = plain_arm9.hmac_sha1_key()? {
             if let Some(key_file) = &self.config.arm9_hmac_sha1_key {
                 let mut file = create_file_and_dirs(path.join(key_file)).await?;
-                file.write_all(arm9_hmac_sha1_key.as_ref()).await.0?;
-                file.flush().await?;
-                file.close().await?;
+                file.write(arm9_hmac_sha1_key.as_ref()).await?;
             }
         } else if self.config.arm9_hmac_sha1_key.is_some() {
             log::warn!("ARM9 HMAC-SHA1 key not found, but config requested it to be saved");
@@ -573,9 +563,7 @@ impl Rom {
                 }
             };
             let mut file = create_file_and_dirs(bin_path).await?;
-            file.write_all(autoload.code()).await.0?;
-            file.flush().await?;
-            file.close().await?;
+            file.write(autoload.code()).await?;
 
             let mut autoload_writer = create_file_and_dirs(config_path).await?;
             write_yaml(&mut autoload_writer, autoload.info()).await?;
@@ -588,9 +576,7 @@ impl Rom {
 
         // --------------------- Save ARM7 program ---------------------
         let mut file = create_file_and_dirs(path.join(&self.config.arm7_bin)).await?;
-        file.write_all(self.arm7.full_data()).await.0?;
-        file.flush().await?;
-        file.close().await?;
+        file.write(self.arm7.full_data()).await?;
 
         let mut arm7_config_writer = create_file_and_dirs(path.join(&self.config.arm7_config)).await?;
         write_yaml(&mut arm7_config_writer, self.arm7.offsets()).await?;
@@ -619,20 +605,18 @@ impl Rom {
                     // TODO: Rewrite traverse_files as an iterator so these errors can be returned
                     create_dir_all(&path).await.expect("failed to create file directory");
                     let mut out_file = create_file(path.join(file.name())).await.expect("failed to create file");
-                    out_file.write_all(file.contents()).await.0.expect("failed to write file");
-                    out_file.flush().await.unwrap();
-                    out_file.close().await.unwrap();
+                    out_file.write(file.contents()).await.expect("failed to write file");
                 })
                 .await;
         }
 
         let mut path_order_file = create_file_and_dirs(path.join(&self.config.path_order)).await?;
+        let mut path_order_buf = Vec::new();
         for path in &self.path_order {
-            path_order_file.write_all(path.as_bytes()).await.0?;
-            path_order_file.write_all("\n".as_bytes()).await.0?;
+            path_order_buf.extend_from_slice(path.as_bytes());
+            path_order_buf.push(b'\n');
         }
-        path_order_file.flush().await.unwrap();
-        path_order_file.close().await.unwrap();
+        path_order_file.write(&path_order_buf).await?;
 
         Ok(())
     }
@@ -670,9 +654,7 @@ impl Rom {
                     plain_overlay.decompress()?;
                 }
                 let mut file = create_file(overlays_path.join(format!("{name}.bin"))).await?;
-                file.write_all(plain_overlay.code()).await.0?;
-                file.flush().await?;
-                file.close().await?;
+                file.write(plain_overlay.code()).await?;
             }
 
             let overlay_table_config = OverlayTableConfig {

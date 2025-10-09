@@ -96,22 +96,23 @@ impl FileSystem {
 
     async fn load_in<P: AsRef<Path>>(&mut self, path: P, parent_id: u16) -> Result<(), FileError> {
         // Sort children by FNT order so the file/dir IDs become correct
-        let mut children = read_dir(&path).await?;
-        children.sort_unstable_by(|a, b| {
-            Self::compare_for_fnt(a.to_string_lossy().as_ref(), false, b.to_string_lossy().as_ref(), false)
-        });
+        let mut dir = read_dir(&path).await?;
+        let mut children = Vec::new();
+        while let Some(child) = dir.next().await.unwrap() {
+            children.push(child);
+        }
+
+        children.sort_unstable_by(|a, b| Self::compare_for_fnt(&a.file_name(), a.is_dir(), &b.file_name(), b.is_dir()));
 
         for child in children.into_iter() {
-            let name = child.file_name().unwrap().to_string_lossy().to_string();
-
-            if read_dir(&child).await.is_ok() {
+            if child.is_dir() {
                 let child_id = self.next_dir_id;
-                let child_path = path.as_ref().join(&name);
-                self.make_child_dir(name, parent_id);
+                let child_path = path.as_ref().join(child.file_name());
+                self.make_child_dir(child.file_name(), parent_id);
                 Box::pin(self.load_in(child_path, child_id)).await?;
             } else {
-                let contents = read_file(child).await?;
-                self.make_child_file(name, parent_id, contents);
+                let contents = read_file(child.path()).await?;
+                self.make_child_file(child.file_name(), parent_id, contents);
             }
         }
         Ok(())
