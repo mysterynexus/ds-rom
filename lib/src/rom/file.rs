@@ -372,7 +372,7 @@ impl<'a> FileSystem<'a> {
         }
     }
 
-    fn find_path(&self, path: &str) -> Option<u16> {
+    pub fn find_path(&self, path: &str) -> Option<u16> {
         self.find_path_in(path, ROOT_DIR_ID)
     }
 
