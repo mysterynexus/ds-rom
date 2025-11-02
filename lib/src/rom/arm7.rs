@@ -56,4 +56,9 @@ impl<'a> Arm7<'a> {
     pub fn offsets(&self) -> &Arm7Offsets {
         &self.offsets
     }
+
+    /// Consumes this [`Arm7`] and returns an owned, 'static version.
+    pub fn into_owned(self) -> Arm7<'static> {
+        Arm7 { data: self.data.into_owned().into(), offsets: self.offsets }
+    }
 }

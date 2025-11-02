@@ -908,6 +908,22 @@ impl<'a> Rom<'a> {
     pub fn config(&self) -> &RomConfig {
         &self.config
     }
+
+    /// Consumes this [`Rom`] and returns an owned, 'static version.
+    pub fn into_owned(self) -> Rom<'static> {
+        Rom {
+            header: self.header,
+            header_logo: self.header_logo,
+            arm9: self.arm9.into_owned(),
+            arm9_overlay_table: self.arm9_overlay_table.into_owned(),
+            arm7: self.arm7.into_owned(),
+            arm7_overlay_table: self.arm7_overlay_table.into_owned(),
+            banner: self.banner,
+            files: self.files.into_owned(),
+            path_order: self.path_order,
+            config: self.config,
+        }
+    }
 }
 
 /// Build context, generated during [`Rom::build`] and later passed to [`Header::build`] to fill in the header.

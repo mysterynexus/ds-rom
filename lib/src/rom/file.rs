@@ -549,6 +549,17 @@ impl<'a> FileSystem<'a> {
 
         paths.into_iter().map(|p| p.path_name).collect()
     }
+
+    /// Consumes this [`FileSystem`] and returns an owned, 'static version.
+    pub fn into_owned(self) -> FileSystem<'static> {
+        FileSystem {
+            num_overlays: self.num_overlays,
+            files: self.files.into_iter().map(|file| file.into_owned()).collect(),
+            dirs: self.dirs,
+            next_file_id: self.next_file_id,
+            next_dir_id: self.next_dir_id,
+        }
+    }
 }
 
 impl File<'_> {
@@ -565,6 +576,16 @@ impl File<'_> {
     /// Returns a reference to the contents of this [`File`].
     pub fn contents(&self) -> &[u8] {
         &self.contents
+    }
+
+    /// Consumes this [`File`] and returns an owned, 'static version.
+    pub fn into_owned(self) -> File<'static> {
+        File {
+            id: self.id,
+            name: self.name,
+            original_offset: self.original_offset,
+            contents: self.contents.into_owned().into(),
+        }
     }
 }
 

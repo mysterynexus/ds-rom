@@ -93,4 +93,12 @@ impl<'a> OverlayTable<'a> {
     pub fn set_signature(&mut self, signature: HmacSha1Signature) {
         self.signature = Some(signature);
     }
+
+    /// Consumes this [`OverlayTable`] and returns an owned, 'static version.
+    pub fn into_owned(self) -> OverlayTable<'static> {
+        OverlayTable {
+            overlays: self.overlays.into_iter().map(|overlay| overlay.into_owned()).collect(),
+            signature: self.signature,
+        }
+    }
 }

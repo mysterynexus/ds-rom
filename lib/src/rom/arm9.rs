@@ -683,6 +683,16 @@ impl<'a> Arm9<'a> {
 
         Ok(())
     }
+
+    /// Consumes this [`Arm9`] and returns an owned, 'static version.
+    pub fn into_owned(self) -> Arm9<'static> {
+        Arm9 {
+            data: self.data.into_owned().into(),
+            offsets: self.offsets,
+            originally_compressed: self.originally_compressed,
+            originally_encrypted: self.originally_encrypted,
+        }
+    }
 }
 
 impl AsRef<[u8]> for Arm9<'_> {

@@ -279,6 +279,16 @@ impl<'a> Overlay<'a> {
         self.signature = Some(self.compute_signature(hmac_sha1)?);
         Ok(())
     }
+
+    /// Consumes this [`Overlay`] and returns an owned, 'static version.
+    pub fn into_owned(self) -> Overlay<'static> {
+        Overlay {
+            data: self.data.into_owned().into(),
+            info: self.info,
+            signature: self.signature,
+            originally_compressed: self.originally_compressed,
+        }
+    }
 }
 
 /// Info of an [`Overlay`], similar to an entry in the overlay table.
