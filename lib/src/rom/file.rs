@@ -19,29 +19,29 @@ use crate::{
 
 /// Contains files and directories to be placed into a ROM.
 pub struct FileSystem<'a> {
-    num_overlays: usize,
-    files: Vec<File<'a>>,
-    dirs: Vec<Dir>,
-    next_file_id: u16,
-    next_dir_id: u16,
+    pub num_overlays: usize,
+    pub files: Vec<File<'a>>,
+    pub dirs: Vec<Dir>,
+    pub next_file_id: u16,
+    pub next_dir_id: u16,
 }
 
 /// A file for the [`FileSystem`] struct.
 #[derive(Clone)]
 pub struct File<'a> {
-    id: u16,
-    name: String,
-    original_offset: u32,
-    contents: Cow<'a, [u8]>,
+    pub id: u16,
+    pub name: String,
+    pub original_offset: u32,
+    pub contents: Cow<'a, [u8]>,
 }
 
 /// A directory for the [`FileSystem`] struct.
 #[derive(Clone)]
 pub struct Dir {
-    id: u16,
-    name: String,
-    parent_id: u16,
-    children: Vec<u16>,
+    pub id: u16,
+    pub name: String,
+    pub parent_id: u16,
+    pub children: Vec<u16>,
 }
 
 /// Errors related to [`FileSystem::parse`].
@@ -372,6 +372,7 @@ impl<'a> FileSystem<'a> {
         }
     }
 
+    /// Finds the ID of a file or directory given a path.
     pub fn find_path(&self, path: &str) -> Option<u16> {
         self.find_path_in(path, ROOT_DIR_ID)
     }
