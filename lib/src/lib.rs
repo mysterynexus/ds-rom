@@ -1,5 +1,6 @@
 //! Extracts and builds Nintendo DS ROMs.
 
+#![feature(error_generic_member_access)]
 #![warn(missing_docs)]
 
 /// Compression algorithms.
