@@ -4,21 +4,27 @@ use serde::{Deserialize, Serialize};
 use snafu::Snafu;
 
 use super::{
-    raw::{self, HmacSha1Signature, OverlayFlags, RawFatError, RawHeaderError},
     Arm9, Arm9OverlaySignaturesError,
+    raw::{self, HmacSha1Signature, OverlayFlags, RawFatError, RawHeaderError},
 };
 use crate::{
     compress::lz77::{Lz77, Lz77DecompressError},
-    crypto::hmac_sha1::HmacSha1,
+    crypto::{
+        dsprot::{DsProtDecryptOptions, DsProtDecryptResult, DsProtEncryptOptions, DsProtError, DsProtInfo, DsProtState},
+        hmac_sha1::HmacSha1,
+    },
+    rom::Arm9HmacSha1KeyError,
 };
 
 /// An overlay module for ARM9/ARM7.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Overlay<'a> {
     originally_compressed: bool,
+    originally_signed: bool,
     info: OverlayInfo,
     signature: Option<HmacSha1Signature>,
     data: Cow<'a, [u8]>,
+    dsprot_state: DsProtState,
 }
 
 const LZ77: Lz77 = Lz77 {};
@@ -27,8 +33,12 @@ const LZ77: Lz77 = Lz77 {};
 pub struct OverlayOptions {
     /// Whether the overlay was originally compressed.
     pub originally_compressed: bool,
+    /// Whether the overlay was originally signed.
+    pub originally_signed: bool,
     /// Overlay info.
     pub info: OverlayInfo,
+    /// Current state of DS Protect. Can be absent, encrypted or unencrypted.
+    pub dsprot_state: DsProtState,
 }
 
 /// Errors related to [`Overlay`].
@@ -52,12 +62,6 @@ pub enum OverlayError {
         /// Source error.
         source: Arm9OverlaySignaturesError,
     },
-    /// Occurs when there are no overlay signatures in the ARM9 program.
-    #[snafu(display("no overlay signatures found in ARM9 program:\n{backtrace}"))]
-    NoOverlaySignatures {
-        /// Backtrace to the source of the error.
-        backtrace: Backtrace,
-    },
     /// Occurs when trying to create a signed ARM7 overlay, but signing ARM7 overlays is not supported.
     #[snafu(display("signing ARM7 overlays is not supported:\n{backtrace}"))]
     SignedArm7Overlay {
@@ -70,15 +74,39 @@ pub enum OverlayError {
         /// Backtrace to the source of the error.
         backtrace: Backtrace,
     },
+    /// Occurs when trying to compute the signature while parsing the ROM, but the original signature was not found in ARM9.
+    #[snafu(transparent)]
+    Arm9HmacSha1Key {
+        /// Source error.
+        source: Arm9HmacSha1KeyError,
+    },
+}
+
+/// Errors related to [`Overlay::decrypt_dsprot`] and [`Overlay::encrypt_dsprot`].
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum OverlayDsProtError {
+    /// Occurs when trying to detect DS Protect while the overlay is compressed.
+    #[snafu(display("overlay must be decompressed before detecting DS Protect:\n{backtrace}"))]
+    Compressed {
+        /// Backtrace to the source of the error.
+        backtrace: Backtrace,
+    },
+    /// See [`DsProtError`].
+    #[snafu(transparent)]
+    DsProtError {
+        /// Source error.
+        source: DsProtError,
+    },
 }
 
 impl<'a> Overlay<'a> {
     /// Creates a new [`Overlay`] from plain data.
     pub fn new<T: Into<Cow<'a, [u8]>>>(data: T, options: OverlayOptions) -> Result<Self, OverlayError> {
-        let OverlayOptions { originally_compressed, info } = options;
+        let OverlayOptions { originally_compressed, originally_signed, info, dsprot_state } = options;
         let data = data.into();
 
-        Ok(Self { originally_compressed, info, signature: None, data })
+        Ok(Self { originally_compressed, originally_signed, info, signature: None, data, dsprot_state })
     }
 
     /// Parses an ARM9 [`Overlay`] from a ROM.
@@ -92,21 +120,32 @@ impl<'a> Overlay<'a> {
         let alloc = fat[overlay.file_id as usize];
         let data = &rom.data()[alloc.range()];
 
-        let mut signature = None;
+        let mut parsed_overlay = Self {
+            originally_compressed: overlay.flags.is_compressed(),
+            originally_signed: overlay.flags.is_signed(),
+            info: OverlayInfo::new(overlay),
+            signature: None,
+            data: Cow::Borrowed(data),
+            dsprot_state: DsProtState::None,
+        };
+
         if overlay.flags.is_signed() {
             let num_overlays = rom.num_arm9_overlays()?;
             let signatures = arm9.overlay_signatures(num_overlays)?;
-            signature = Some(signatures.map(|s| s[overlay.id as usize]).ok_or_else(|| NoOverlaySignaturesSnafu {}.build())?);
+            if let Some(signatures) = signatures {
+                parsed_overlay.signature = Some(signatures[overlay.id as usize]);
+            } else if let Some(key) = arm9.hmac_sha1_key()? {
+                // Compute the signature if it's missing
+                parsed_overlay.sign(&HmacSha1::new(key))?;
+            } else {
+                log::error!(
+                    "ARM9 overlay {} was marked as signed, but no signature or HMAC-SHA1 key was found in ARM9",
+                    overlay.id
+                );
+            }
         }
 
-        let overlay = Self {
-            originally_compressed: overlay.flags.is_compressed(),
-            info: OverlayInfo::new(overlay),
-            signature,
-            data: Cow::Borrowed(data),
-        };
-
-        Ok(overlay)
+        Ok(parsed_overlay)
     }
 
     /// Parses an ARM7 [`Overlay`] from a ROM.
@@ -126,9 +165,11 @@ impl<'a> Overlay<'a> {
 
         let overlay = Self {
             originally_compressed: overlay.flags.is_compressed(),
+            originally_signed: overlay.flags.is_signed(),
             info: OverlayInfo::new(overlay),
             signature: None,
             data: Cow::Borrowed(data),
+            dsprot_state: DsProtState::None,
         };
 
         Ok(overlay)
@@ -201,7 +242,8 @@ impl<'a> Overlay<'a> {
         self.info.compressed
     }
 
-    /// Returns whether this [`Overlay`] has a signature.
+    /// Returns whether this [`Overlay`] has a signature. See [`Self::originally_signed`] for whether this overlay was
+    /// signed originally.
     pub fn is_signed(&self) -> bool {
         self.signature.is_some()
     }
@@ -250,6 +292,11 @@ impl<'a> Overlay<'a> {
         self.originally_compressed
     }
 
+    /// Returns whether this [`Overlay`] was compressed signed. See [`Self::is_signed`] for the current state.
+    pub fn originally_signed(&self) -> bool {
+        self.originally_signed
+    }
+
     /// Computes the signature of this [`Overlay`] using the given HMAC-SHA1 key.
     pub fn compute_signature(&self, hmac_sha1: &HmacSha1) -> Result<HmacSha1Signature, OverlayError> {
         if self.is_compressed() != self.originally_compressed {
@@ -287,12 +334,78 @@ impl<'a> Overlay<'a> {
             info: self.info,
             signature: self.signature,
             originally_compressed: self.originally_compressed,
+            originally_signed: self.originally_signed,
+            dsprot_state: self.dsprot_state,
         }
+    }
+
+    /// Decrypts all functions in this overlay that were encrypted by DS Protect. Does nothing if
+    /// [`Overlay::dsprot_state`] is [`DsProtState::Unencrypted`].
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if [`DsProtInfo::decrypt`] fails.
+    pub fn decrypt_dsprot(
+        &mut self,
+        options: &DsProtDecryptOptions,
+    ) -> Result<Option<&DsProtDecryptResult>, OverlayDsProtError> {
+        if self.dsprot_state.is_unencrypted() {
+            // Can't flatten this code due to conditional reference return (known borrow checker limitation)
+            if let DsProtState::Unencrypted(result) = &self.dsprot_state {
+                Ok(Some(result))
+            } else {
+                unreachable!();
+            }
+        } else {
+            let dsprot_info = if self.is_compressed() {
+                return overlay_ds_prot_error::CompressedSnafu.fail();
+            } else if let Some(dsprot_info) = DsProtInfo::detect(&self.data) {
+                dsprot_info
+            } else {
+                // DS Protect is not used
+                return Ok(None);
+            };
+
+            let base_address = self.base_address();
+            let result = dsprot_info.decrypt(self.data.to_mut(), base_address, options)?;
+            self.dsprot_state = DsProtState::Unencrypted(result);
+            let DsProtState::Unencrypted(result) = &self.dsprot_state else { unreachable!() };
+            Ok(Some(result))
+        }
+    }
+
+    /// Encrypts DS Protect functions in this overlay. This can only be done if
+    /// [`Overlay::dsprot_state`] is [`DsProtState::Unencrypted`].
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if [`DsProtInfo::decrypt`] fails.
+    pub fn encrypt_dsprot(&mut self, options: &DsProtEncryptOptions) -> Result<(), OverlayDsProtError> {
+        let dsprot_state = std::mem::replace(&mut self.dsprot_state, DsProtState::None);
+        let DsProtState::Unencrypted(dsprot_result) = dsprot_state else {
+            self.dsprot_state = dsprot_state; // revert replace
+            return Ok(());
+        };
+
+        let base_address = self.base_address();
+        dsprot_result.encrypt(self.data.to_mut(), base_address, options)?;
+        self.dsprot_state = DsProtState::Encrypted(dsprot_result);
+
+        Ok(())
+    }
+
+    /// Returns the [`DsProtState`] of this overlay.
+    pub fn dsprot_state(&self) -> &DsProtState {
+        &self.dsprot_state
+    }
+
+    pub(crate) fn set_dsprot_state(&mut self, dsprot_state: DsProtState) {
+        self.dsprot_state = dsprot_state;
     }
 }
 
 /// Info of an [`Overlay`], similar to an entry in the overlay table.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct OverlayInfo {
     /// Overlay ID.
     pub id: u32,

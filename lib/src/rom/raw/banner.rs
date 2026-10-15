@@ -83,7 +83,7 @@ impl<'a> Banner<'a> {
     /// or is not aligned enough.
     pub fn borrow_from_slice(data: &'a [u8]) -> Result<Self, RawBannerError> {
         let addr = data as *const [u8] as *const () as usize;
-        if addr % 2 != 0 {
+        if !addr.is_multiple_of(2) {
             return MisalignedSnafu { expected: 2usize, actual: 1usize << addr.trailing_zeros() as usize }.fail();
         }
 
@@ -200,7 +200,7 @@ impl<'a> Banner<'a> {
     }
 
     /// Creates a [`DisplayBanner`] which implements [`Display`].
-    pub fn display(&self, indent: usize) -> DisplayBanner {
+    pub fn display(&self, indent: usize) -> DisplayBanner<'_> {
         DisplayBanner { banner: self, indent }
     }
 }
@@ -506,6 +506,16 @@ pub struct BannerAnimation {
     pub palettes: [BannerPalette; 8],
     /// Up to 64 keyframes.
     pub keyframes: [BannerKeyframe; 64],
+}
+
+impl BannerAnimation {
+    /// Finds the first palette used by the given bitmap.
+    pub fn palette_of(&self, bitmap_index: usize) -> usize {
+        self.keyframes
+            .iter()
+            .find(|keyframe| keyframe.frame_duration() > 0 && keyframe.bitmap_index() as usize == bitmap_index)
+            .map_or(0, |keyframe| keyframe.palette_index() as usize)
+    }
 }
 
 /// A keyframe for [`BannerAnimation`].

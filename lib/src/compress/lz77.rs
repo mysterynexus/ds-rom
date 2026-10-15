@@ -236,9 +236,7 @@ pub enum Lz77ParseError {
         backtrace: Backtrace,
     },
     /// Occurs when a length-distance pair would point to data that is not within the decompressed stream.
-    #[snafu(display(
-        "length-distance pair {pair} at offset {offset:#x} points outside of decompressed stream:\n{backtrace}"
-    ))]
+    #[snafu(display("length-distance pair {pair} at offset {offset:#x} points outside of decompressed stream:\n{backtrace}"))]
     OutOfBounds {
         /// The erroneous length-distance pair.
         pair: Pair,

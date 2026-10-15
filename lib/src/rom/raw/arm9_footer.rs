@@ -6,7 +6,7 @@ use std::{
 use bytemuck::{Pod, PodCastError, Zeroable};
 use snafu::{Backtrace, Snafu};
 
-use super::{RawHeaderError, NITROCODE};
+use super::{NITROCODE, RawHeaderError};
 
 /// Footer of the ARM9 program.
 #[repr(C)]
@@ -121,7 +121,7 @@ impl Arm9Footer {
     }
 
     /// Creates a [`DisplayArm9Footer`] which implements [`Display`].
-    pub fn display(&self, indent: usize) -> DisplayArm9Footer {
+    pub fn display(&self, indent: usize) -> DisplayArm9Footer<'_> {
         DisplayArm9Footer { footer: self, indent }
     }
 }

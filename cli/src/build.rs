@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::Args;
 use ds_rom::{
     crypto::blowfish::BlowfishKey,
@@ -29,8 +29,11 @@ pub struct Build {
 
 impl Build {
     pub fn run(&self) -> Result<()> {
-        let key =
-            if let Some(arm7_bios) = &self.arm7_bios { Some(BlowfishKey::from_arm7_bios_path(arm7_bios)?) } else { None };
+        let key = if let Some(arm7_bios) = &self.arm7_bios {
+            Some(BlowfishKey::from_arm7_bios_path(arm7_bios)?)
+        } else {
+            None
+        };
 
         let options = RomLoadOptions { key: key.as_ref(), compress: !self.no_compress, ..Default::default() };
         let rom = match Rom::load(&self.config, options) {

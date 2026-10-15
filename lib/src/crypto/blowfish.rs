@@ -7,7 +7,7 @@ use std::{
 use bytemuck::{Pod, Zeroable};
 use snafu::{Backtrace, Snafu};
 
-use crate::io::{open_file, FileError};
+use crate::io::{FileError, open_file};
 
 /// De/encrypts data using the [Blowfish](https://en.wikipedia.org/wiki/Blowfish_(cipher)) block cipher.
 #[repr(C)]
@@ -58,10 +58,10 @@ impl Blowfish {
     ///
     /// This function will return an error if `data.len()` is not a multiple of 8.
     pub fn encrypt(&self, data: &mut [u8]) -> Result<(), BlowfishError> {
-        if data.len() % 8 != 0 {
+        if !data.len().is_multiple_of(8) {
             OddBlockCountSnafu {}.fail()?;
         }
-        for chunk in data.chunks_exact_mut(8) {
+        for chunk in data.as_chunks_mut::<8>().0 {
             let mut left = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             let mut right = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
             self.encrypt_block(&mut left, &mut right);
@@ -89,7 +89,7 @@ impl Blowfish {
     ///
     /// This function will return an error if `data.len()` is not a multiple of 8.
     pub fn decrypt(&self, data: &mut [u8]) -> Result<(), BlowfishError> {
-        if data.len() % 8 != 0 {
+        if !data.len().is_multiple_of(8) {
             OddBlockCountSnafu {}.fail()?;
         }
         for chunk in data.chunks_mut(8) {

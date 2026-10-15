@@ -1,11 +1,11 @@
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use ds_rom::{
     compress::lz77::Lz77,
-    crypto::{blowfish::BlowfishKey, hmac_sha1::HmacSha1},
-    rom::{self, raw, Arm9, Logo, Overlay, Rom},
+    crypto::{blowfish::BlowfishKey, dsprot::DsProtDecryptOptions, hmac_sha1::HmacSha1},
+    rom::{self, Arm9, Logo, Overlay, Rom, raw},
 };
 
 use crate::print_hex;
@@ -39,8 +39,11 @@ pub struct Dump {
 
 impl Dump {
     pub fn run(&self) -> Result<()> {
-        let key =
-            if let Some(arm7_bios) = &self.arm7_bios { Some(BlowfishKey::from_arm7_bios_path(arm7_bios)?) } else { None };
+        let key = if let Some(arm7_bios) = &self.arm7_bios {
+            Some(BlowfishKey::from_arm7_bios_path(arm7_bios)?)
+        } else {
+            None
+        };
 
         let rom = raw::Rom::from_file(self.rom.clone())?;
         let header = rom.header()?;
@@ -75,6 +78,9 @@ impl Dump {
             DumpCommand::Arm7Overlay(dump_arm7_overlay) => dump_arm7_overlay.run(&rom),
             DumpCommand::Arm9Footer(dump_arm9_footer) => dump_arm9_footer.run(&rom),
             DumpCommand::Arm9OverlaySignatures(dump_arm9_overlay_signatures) => dump_arm9_overlay_signatures.run(&rom),
+            DumpCommand::MultibootSignature(dump_multiboot_signature) => dump_multiboot_signature.run(&rom),
+            DumpCommand::Libraries(dump_libraries) => dump_libraries.run(&rom),
+            DumpCommand::DsProt(dump_dsprot) => dump_dsprot.run(&rom),
         }
     }
 }
@@ -103,6 +109,12 @@ enum DumpCommand {
     Arm9Footer(DumpArm9Footer),
     #[command(name = "arm9-ov-sigs")]
     Arm9OverlaySignatures(DumpArm9OverlaySignatures),
+    #[command(name = "mb-sig")]
+    MultibootSignature(DumpMultibootSignature),
+    #[command(name = "libs")]
+    Libraries(DumpLibraries),
+    #[command(name = "dsprot")]
+    DsProt(DumpDsProt),
 }
 
 /// Shows the contents of the ROM header.
@@ -434,8 +446,11 @@ struct DumpArm9Footer {}
 
 impl DumpArm9Footer {
     pub fn run(&self, rom: &raw::Rom) -> Result<()> {
-        let arm9_footer = rom.arm9_footer()?;
-        println!("ARM9 footer:\n{}", arm9_footer.display(2));
+        if let Some(arm9_footer) = rom.arm9_footer()? {
+            println!("ARM9 footer:\n{}", arm9_footer.display(2));
+        } else {
+            println!("No ARM9 footer");
+        }
 
         Ok(())
     }
@@ -490,6 +505,91 @@ impl DumpArm9OverlaySignatures {
                     println!("ARM9 overlay {} has no signature", overlay.id());
                 }
             }
+        }
+
+        Ok(())
+    }
+}
+
+/// Prints the multiboot (download play) signature.
+#[derive(Args)]
+struct DumpMultibootSignature {}
+
+impl DumpMultibootSignature {
+    pub fn run(&self, raw_rom: &raw::Rom) -> Result<()> {
+        let rom = Rom::extract(raw_rom)?;
+
+        if let Some(multiboot_signature) = rom.multiboot_signature() {
+            println!("{}", multiboot_signature.display(2));
+        } else {
+            println!("No multiboot signature found");
+        }
+
+        Ok(())
+    }
+}
+
+/// Prints libraries used by the game.
+#[derive(Args)]
+pub struct DumpLibraries {}
+
+impl DumpLibraries {
+    pub fn run(&self, raw_rom: &raw::Rom) -> Result<()> {
+        let arm9 = raw_rom.arm9()?;
+        let libraries = arm9.libraries()?;
+
+        if libraries.is_empty() {
+            println!("No libraries found");
+        }
+        for library in libraries {
+            println!("{}", library.display(2));
+        }
+
+        Ok(())
+    }
+}
+
+/// Prints information about DS Protect usage.
+#[derive(Args)]
+pub struct DumpDsProt {
+    #[arg(long)]
+    yaml: bool,
+}
+
+impl DumpDsProt {
+    pub fn run(&self, raw_rom: &raw::Rom) -> Result<()> {
+        let mut rom = Rom::extract(raw_rom)?;
+
+        let arm9 = rom.arm9_mut();
+        arm9.decompress()?;
+        for overlay in rom.arm9_overlays_mut() {
+            overlay.decompress()?;
+        }
+
+        let options = DsProtDecryptOptions { decode_relocations: true };
+
+        let arm9 = rom.arm9_mut();
+        if !self.yaml {
+            if let Some(dsprot_result) = arm9.dsprot_state().as_option() {
+                println!("DS Protect found in ARM9 main:\n{}", dsprot_result.display(2));
+            }
+
+            for overlay in rom.arm9_overlays_mut() {
+                if let Some(dsprot_result) = overlay.dsprot_state().as_option() {
+                    println!("DS Protect found in ARM9 overlay {}:\n{}", overlay.id(), dsprot_result.display(2));
+                }
+            }
+        } else {
+            let mut details_list = HashMap::new();
+            if let Some(details) = arm9.decrypt_dsprot(&options)?.cloned() {
+                details_list.insert("arm9".to_string(), details);
+            }
+            for overlay in rom.arm9_overlays_mut() {
+                if let Some(details) = overlay.decrypt_dsprot(&options)?.cloned() {
+                    details_list.insert(format!("ov{:03}", overlay.id()), details);
+                }
+            }
+            serde_saphyr::to_io_writer(&mut std::io::stdout().lock(), &details_list)?;
         }
 
         Ok(())

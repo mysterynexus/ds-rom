@@ -13,34 +13,47 @@ use snafu::{Backtrace, Snafu};
 
 use super::raw::{self, FileAlloc, Fnt, FntDirectory, FntFile, FntSubtable, RawHeaderError};
 use crate::{
-    io::{read_dir, read_file, FileError},
+    io::{FileError, read_dir, read_file},
     str::BlobSize,
 };
 
 /// Contains files and directories to be placed into a ROM.
 pub struct FileSystem<'a> {
+    /// Number of overlays occupying file allocation table entries before regular files.
     pub num_overlays: usize,
+    /// Regular files, ordered by file ID after the overlay entries.
     pub files: Vec<File<'a>>,
+    /// Directories, starting with the root directory.
     pub dirs: Vec<Dir>,
+    /// File ID to assign to the next added file.
     pub next_file_id: u16,
+    /// Directory ID to assign to the next added directory.
     pub next_dir_id: u16,
 }
 
 /// A file for the [`FileSystem`] struct.
 #[derive(Clone)]
 pub struct File<'a> {
+    /// File allocation table ID.
     pub id: u16,
+    /// File name within its parent directory.
     pub name: String,
+    /// Byte offset of this file in the original ROM.
     pub original_offset: u32,
+    /// File contents, borrowed from a ROM or owned.
     pub contents: Cow<'a, [u8]>,
 }
 
 /// A directory for the [`FileSystem`] struct.
 #[derive(Clone)]
 pub struct Dir {
+    /// Directory ID, starting at 0xf000 for the root directory.
     pub id: u16,
+    /// Directory name within its parent directory.
     pub name: String,
+    /// Parent directory ID, or zero for the root directory.
     pub parent_id: u16,
+    /// IDs of child files and directories.
     pub children: Vec<u16>,
 }
 
@@ -96,15 +109,21 @@ impl<'a> FileSystem<'a> {
 
     fn load_in<P: AsRef<Path>>(&mut self, path: P, parent_id: u16) -> Result<(), FileError> {
         // Sort children by FNT order so the file/dir IDs become correct
-        let mut children =
-            read_dir(&path)?.collect::<Result<Vec<_>, _>>()?.into_iter().map(|entry| entry.path()).collect::<Vec<_>>();
-        children.sort_unstable_by(|a, b| {
-            Self::compare_for_fnt(a.to_string_lossy().as_ref(), a.is_dir(), b.to_string_lossy().as_ref(), b.is_dir())
-        });
+        let mut children = read_dir(&path)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|entry| entry.path())
+            .map(|child| {
+                let as_string = child.to_string_lossy().to_string();
+                let is_dir = child.is_dir();
+                (child, as_string, is_dir)
+            })
+            .collect::<Vec<_>>();
+        children.sort_unstable_by(|a, b| Self::compare_for_fnt(&a.1, a.2, &b.1, b.2));
 
-        for child in children.into_iter() {
+        for (child, _, is_dir) in children.into_iter() {
             let name = child.file_name().unwrap().to_string_lossy().to_string();
-            if child.is_dir() {
+            if is_dir {
                 let child_id = self.next_dir_id;
                 let child_path = path.as_ref().join(&name);
                 self.make_child_dir(name, parent_id);
@@ -158,7 +177,7 @@ impl<'a> FileSystem<'a> {
     }
 
     /// Returns a file.
-    pub fn file(&self, id: u16) -> &File {
+    pub fn file(&self, id: u16) -> &File<'a> {
         &self.files[id as usize - self.num_overlays]
     }
 
@@ -237,7 +256,7 @@ impl<'a> FileSystem<'a> {
         }
     }
 
-    fn build_subtable(&self, parent: &Dir) -> Result<FntSubtable, FileBuildError> {
+    fn build_subtable(&self, parent: &Dir) -> Result<FntSubtable<'a>, FileBuildError> {
         let mut data = vec![];
 
         for child in &parent.children {
@@ -287,7 +306,7 @@ impl<'a> FileSystem<'a> {
     /// # Errors
     ///
     /// This function will return an error if a file/directory name contains non-ASCII characters.
-    pub fn build_fnt(&self) -> Result<Fnt, FileBuildError> {
+    pub fn build_fnt(&self) -> Result<Fnt<'_>, FileBuildError> {
         let mut subtables = vec![];
         self.build_fnt_recursive(&mut subtables, ROOT_DIR_ID)?;
         Ok(Fnt { subtables: subtables.into_boxed_slice() })
@@ -386,7 +405,7 @@ impl<'a> FileSystem<'a> {
         self.dirs.last().unwrap()
     }
 
-    fn make_child_file(&mut self, name: String, parent_id: u16, contents: Vec<u8>) -> &File {
+    fn make_child_file(&mut self, name: String, parent_id: u16, contents: Vec<u8>) -> &File<'a> {
         let id = self.next_file_id;
         self.files.push(File { id, name, original_offset: 0, contents: contents.into() });
         let parent = self.dir_mut(parent_id);
@@ -458,7 +477,11 @@ impl<'a> FileSystem<'a> {
         let mut max_id = 0;
         let parent = self.dir(parent_id);
         for child in &parent.children {
-            let id = if Self::is_dir(*child) { self.max_file_id_in(*child) } else { *child };
+            let id = if Self::is_dir(*child) {
+                self.max_file_id_in(*child)
+            } else {
+                *child
+            };
             if id > max_id {
                 max_id = id;
             }
@@ -472,7 +495,7 @@ impl<'a> FileSystem<'a> {
     }
 
     /// Creates a [`DisplayFileSystem`] which implements [`Display`].
-    pub fn display(&self, indent: usize) -> DisplayFileSystem {
+    pub fn display(&self, indent: usize) -> DisplayFileSystem<'_> {
         DisplayFileSystem { files: self, parent_id: ROOT_DIR_ID, indent }
     }
 

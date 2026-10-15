@@ -1,7 +1,7 @@
 use std::{fmt::Display, str::FromStr};
 
 use bytemuck::{Pod, Zeroable};
-use serde::{de, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de};
 use snafu::{Backtrace, Snafu};
 
 /// A fixed-size ASCII string.
@@ -140,31 +140,4 @@ impl Display for BlobSize {
             0x100000.. => write!(f, "{:.1}MB", size as f32 / 0x100000 as f32),
         }
     }
-}
-
-/// For debugging purposes.
-#[allow(unused)]
-pub(crate) fn write_hex(f: &mut std::fmt::Formatter<'_>, data: &[u8]) -> std::fmt::Result {
-    for (offset, chunk) in data.chunks(16).enumerate() {
-        write!(f, "{:08x} ", offset * 16)?;
-        for byte in chunk {
-            write!(f, " {byte:02x}")?;
-        }
-        writeln!(f)?;
-    }
-    writeln!(f)?;
-    Ok(())
-}
-
-/// For debugging purposes.
-#[allow(unused)]
-pub(crate) fn print_hex(data: &[u8]) {
-    for (offset, chunk) in data.chunks(16).enumerate() {
-        print!("{:08x} ", offset * 16);
-        for byte in chunk {
-            print!(" {byte:02x}");
-        }
-        println!();
-    }
-    println!();
 }

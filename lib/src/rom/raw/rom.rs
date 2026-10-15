@@ -1,14 +1,17 @@
 use std::{borrow::Cow, collections::BTreeSet, io::Read, mem::size_of, path::Path};
 
-use snafu::Snafu;
+use snafu::{Backtrace, Snafu};
 
 use super::{
-    Arm9Footer, Arm9FooterError, Banner, FileAlloc, Fnt, Header, Overlay, OverlayTable, RawBannerError, RawBuildInfoError,
-    RawFatError, RawFntError, RawHeaderError, RawOverlayError,
+    Arm9Footer, Arm9FooterError, Banner, FileAlloc, Fnt, Header, NITROCODE_BYTES, Overlay, OverlayTable, RawBannerError,
+    RawBuildInfoError, RawFatError, RawFntError, RawHeaderError, RawOverlayError,
 };
 use crate::{
-    io::{open_file, write_file, FileError},
-    rom::{Arm7, Arm7Offsets, Arm9, Arm9Offsets, RomConfigAlignment},
+    io::{FileError, open_file, write_file},
+    rom::{
+        Arm7, Arm7Offsets, Arm9, Arm9Offsets, Arm9Options, RomConfigAlignment, RomConfigPaddingValues,
+        raw::{MultibootSignature, RawMultibootSignatureError},
+    },
 };
 
 /// A raw DS ROM, see the plain struct [here](super::super::Rom).
@@ -36,6 +39,12 @@ pub enum RawArm9Error {
     RawBuildInfo {
         /// Source error.
         source: RawBuildInfoError,
+    },
+    /// Occurs when the ARM9 build info can be found neither in the header nor in an ARM9 footer.
+    #[snafu(display("ROM header has no ARM9 build info offset and there is no ARM9 footer to take one from:\n{backtrace}"))]
+    NoBuildInfo {
+        /// Backtrace to the source of the error.
+        backtrace: Backtrace,
     },
 }
 
@@ -102,7 +111,7 @@ impl<'a> Rom<'a> {
     /// # Errors
     ///
     /// See [`Self::header`].
-    pub fn arm9(&self) -> Result<Arm9, RawArm9Error> {
+    pub fn arm9(&self) -> Result<Arm9<'_>, RawArm9Error> {
         let header = self.header()?;
         let start = header.arm9.offset as usize;
         let end = start + header.arm9.size as usize;
@@ -110,6 +119,7 @@ impl<'a> Rom<'a> {
 
         let footer = self.arm9_footer()?;
         let build_info_offset = if header.arm9_build_info_offset == 0 {
+            let Some(footer) = footer else { return NoBuildInfoSnafu {}.fail() };
             footer.build_info_offset
         } else if header.arm9_build_info_offset > header.arm9.offset {
             header.arm9_build_info_offset - header.arm9.offset
@@ -118,29 +128,38 @@ impl<'a> Rom<'a> {
             header.arm9_build_info_offset
         };
 
-        Ok(Arm9::new(
+        let arm9 = Arm9::new(
             Cow::Borrowed(data),
             Arm9Offsets {
                 base_address: header.arm9.base_addr,
                 entry_function: header.arm9.entry,
                 build_info: build_info_offset,
                 autoload_callback: header.arm9_autoload_callback,
-                overlay_signatures: footer.overlay_signatures_offset,
+                overlay_signatures: footer.map_or(0, |footer| footer.overlay_signatures_offset),
             },
-        )?)
+            Arm9Options { has_footer: footer.is_some() },
+        )?;
+        Ok(arm9)
     }
 
-    /// Returns a reference to the ARM9 footer of this [`Rom`].
+    /// Returns a reference to the ARM9 footer of this [`Rom`], or [`None`] if this ROM has no ARM9 footer. The footer is
+    /// considered absent if it doesn't fit in the ROM or doesn't start with the nitrocode.
     ///
     /// # Errors
     ///
     /// See [`Self::header`] and [`Arm9Footer::borrow_from_slice`].
-    pub fn arm9_footer(&self) -> Result<&Arm9Footer, Arm9FooterError> {
+    pub fn arm9_footer(&self) -> Result<Option<&Arm9Footer>, Arm9FooterError> {
         let header = self.header()?;
         let start = (header.arm9.offset + header.arm9.size) as usize;
         let end = start + size_of::<Arm9Footer>();
+        if end > self.data.len() {
+            return Ok(None);
+        }
         let data = &self.data[start..end];
-        Arm9Footer::borrow_from_slice(data)
+        if data[0..4] != NITROCODE_BYTES {
+            return Ok(None);
+        }
+        Arm9Footer::borrow_from_slice(data).map(Some)
     }
 
     /// Returns a mutable reference to the ARM9 footer of this [`Rom`].
@@ -178,7 +197,7 @@ impl<'a> Rom<'a> {
     /// # Errors
     ///
     /// See [`Self::arm9`] and [`Self::arm9_overlay_table_with`].
-    pub fn arm9_overlay_table(&self) -> Result<OverlayTable, RawOverlayError> {
+    pub fn arm9_overlay_table(&self) -> Result<OverlayTable<'_>, RawOverlayError> {
         let arm9 = self.arm9()?;
         self.arm9_overlay_table_with(&arm9)
     }
@@ -188,7 +207,7 @@ impl<'a> Rom<'a> {
     /// # Errors
     ///
     /// See [`Self::arm9_overlays`] and [`Arm9::overlay_table_signature`].
-    pub fn arm9_overlay_table_with(&self, arm9: &Arm9) -> Result<OverlayTable, RawOverlayError> {
+    pub fn arm9_overlay_table_with(&self, arm9: &Arm9) -> Result<OverlayTable<'_>, RawOverlayError> {
         let overlays = self.arm9_overlays()?;
         let signature = arm9.overlay_table_signature()?.cloned();
         Ok(OverlayTable::new(overlays, signature))
@@ -211,24 +230,27 @@ impl<'a> Rom<'a> {
     /// # Errors
     ///
     /// See [`Self::header`].
-    pub fn arm7(&self) -> Result<Arm7, RawHeaderError> {
+    pub fn arm7(&self) -> Result<Arm7<'_>, RawHeaderError> {
         let header = self.header()?;
         let start = header.arm7.offset as usize;
         let end = start + header.arm7.size as usize;
         let data = &self.data[start..end];
 
-        let build_info_offset =
-            if header.arm7_build_info_offset == 0 { 0 } else { header.arm7_build_info_offset - header.arm7.offset };
+        let build_info_offset = if header.arm7_build_info_offset == 0 {
+            0
+        } else if header.arm7_build_info_offset > header.arm7.offset {
+            header.arm7_build_info_offset - header.arm7.offset
+        } else {
+            // `arm7_build_info_offset` is not an absolute ROM offset in DSi titles
+            header.arm7_build_info_offset
+        };
 
-        Ok(Arm7::new(
-            Cow::Borrowed(data),
-            Arm7Offsets {
-                base_address: header.arm7.base_addr,
-                entry_function: header.arm7.entry,
-                build_info: build_info_offset,
-                autoload_callback: header.arm7_autoload_callback,
-            },
-        ))
+        Ok(Arm7::new(Cow::Borrowed(data), Arm7Offsets {
+            base_address: header.arm7.base_addr,
+            entry_function: header.arm7.entry,
+            build_info: build_info_offset,
+            autoload_callback: header.arm7_autoload_callback,
+        }))
     }
 
     /// Returns the ARM7 overlay table of this [`Rom`].
@@ -253,7 +275,7 @@ impl<'a> Rom<'a> {
     /// # Errors
     ///
     /// See [`Self::arm7_overlays`].
-    pub fn arm7_overlay_table(&self) -> Result<OverlayTable, RawOverlayError> {
+    pub fn arm7_overlay_table(&self) -> Result<OverlayTable<'_>, RawOverlayError> {
         let overlays = self.arm7_overlays()?;
         Ok(OverlayTable::new(overlays, None))
     }
@@ -275,7 +297,7 @@ impl<'a> Rom<'a> {
     /// # Errors
     ///
     /// See [`Self::header`] and [`Fnt::borrow_from_slice`].
-    pub fn fnt(&self) -> Result<Fnt, RawFntError> {
+    pub fn fnt(&self) -> Result<Fnt<'_>, RawFntError> {
         let header = self.header()?;
         let start = header.file_names.offset as usize;
         let end = start + header.file_names.size as usize;
@@ -302,11 +324,78 @@ impl<'a> Rom<'a> {
     /// # Errors
     ///
     /// See [`Self::header`] and [`Banner::borrow_from_slice`].
-    pub fn banner(&self) -> Result<Banner, RawBannerError> {
+    pub fn banner(&self) -> Result<Banner<'_>, RawBannerError> {
         let header = self.header()?;
         let start = header.banner_offset as usize;
         let data = &self.data[start..];
         Banner::borrow_from_slice(data)
+    }
+
+    /// Returns the multiboot signature of this [`Rom`].
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::header`] and [`MultibootSignature::borrow_from_slice`].
+    pub fn multiboot_signature(&self) -> Result<Option<MultibootSignature>, RawMultibootSignatureError> {
+        let header = self.header()?;
+        let start = header.rom_size_ds as usize;
+        let data = &self.data[start..];
+        match MultibootSignature::from_slice(data) {
+            Ok(s) => Ok(Some(s)),
+            Err(RawMultibootSignatureError::InvalidMagic { .. }) => Ok(None), // signature not found
+            Err(RawMultibootSignatureError::DataTooSmall { .. }) => Ok(None), // signature truncated or absent at EOF
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Returns the padding values between ROM sections.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::header`], [`Self::fat`], [`Self::arm9_overlays`], [`Self::arm7_overlays`] and
+    /// [`Self::file_image_padding_value`].
+    pub fn padding_values(&self) -> Result<RomConfigPaddingValues, RomAlignmentsError> {
+        let header = self.header()?;
+        let fat = self.fat()?;
+        let arm9_overlays = self.arm9_overlays()?;
+        let arm7_overlays = self.arm7_overlays()?;
+
+        Ok(RomConfigPaddingValues {
+            arm9: self.data[header.arm9.offset as usize - 1],
+            arm9_overlay_table: if header.arm9_overlays.offset > 0 {
+                self.data[header.arm9_overlays.offset as usize - 1]
+            } else {
+                DEFAULT_PADDING_VALUE
+            },
+            arm9_overlays: self.get_overlays_padding(arm9_overlays, fat).unwrap_or(DEFAULT_PADDING_VALUE),
+            arm7: self.data[header.arm7.offset as usize - 1],
+            arm7_overlay_table: if header.arm7_overlays.offset > 0 {
+                self.data[header.arm7_overlays.offset as usize - 1]
+            } else {
+                DEFAULT_PADDING_VALUE
+            },
+            arm7_overlays: self.get_overlays_padding(arm7_overlays, fat).unwrap_or(DEFAULT_PADDING_VALUE),
+            fnt: self.data[header.file_names.offset as usize - 1],
+            fat: self.data[header.file_allocs.offset as usize - 1],
+            banner: self.data[header.banner_offset as usize - 1],
+            file_image: self.file_image_padding_value()?,
+            rom: *self.data.last().unwrap_or(&DEFAULT_PADDING_VALUE),
+        })
+    }
+
+    fn get_overlays_padding(&self, overlays: &[Overlay], fat: &[FileAlloc]) -> Option<u8> {
+        let mut overlay_files = overlays.iter().map(|o| &fat[o.id as usize]).collect::<Vec<_>>();
+        overlay_files.sort_unstable_by_key(|o| o.start);
+        let mut overlay_files = overlay_files.into_iter();
+        if let Some(mut prev_overlay) = overlay_files.next() {
+            for overlay in overlay_files {
+                if prev_overlay.end != overlay.start {
+                    return Some(self.data[overlay.start as usize - 1]);
+                }
+                prev_overlay = overlay;
+            }
+        }
+        None
     }
 
     /// Returns the padding value in the file image block of this [`Rom`].
@@ -314,7 +403,7 @@ impl<'a> Rom<'a> {
     /// # Errors
     ///
     /// See [`Self::fat`], [`Self::arm9_overlays`] and [`Self::arm7_overlays`].
-    pub fn file_image_padding_value(&self) -> Result<u8, RomAlignmentsError> {
+    fn file_image_padding_value(&self) -> Result<u8, RomAlignmentsError> {
         let fat = self.fat()?;
         let arm9_overlays = self.arm9_overlays()?;
         let arm7_overlays = self.arm7_overlays()?;
@@ -332,49 +421,8 @@ impl<'a> Rom<'a> {
 
         // Find a gap between two adjacent files, and return the padding byte between them
         let Some(gap) = files.windows(2).find(|pair| pair[0].end != pair[1].start) else {
-            return Ok(0xff);
+            return Ok(DEFAULT_PADDING_VALUE);
         };
-        Ok(self.data[gap[0].end as usize])
-    }
-
-    /// Returns the section padding value of this [`Rom`].
-    ///
-    /// # Errors
-    ///
-    /// See [`Self::header`], [`Self::banner`], [`Self::fat`], [`Self::arm9_overlays`] and [`Self::arm7_overlays`].
-    pub fn section_padding_value(&self) -> Result<u8, RomAlignmentsError> {
-        let header = self.header()?;
-        let banner = self.banner()?;
-        let fat = self.fat()?;
-        let arm9_overlays = self.arm9_overlays()?;
-        let arm7_overlays = self.arm7_overlays()?;
-
-        // Get sorted list of adjacent sections in the ROM
-        let mut sections = vec![
-            header.arm9.offset..header.arm9.offset + header.arm9.size + size_of::<Arm9Footer>() as u32,
-            header.arm7.offset..header.arm7.offset + header.arm7.size,
-            header.file_names.offset..header.file_names.offset + header.file_names.size,
-            header.file_allocs.offset..header.file_allocs.offset + header.file_allocs.size,
-            header.arm9_overlays.offset..header.arm9_overlays.offset + header.arm9_overlays.size,
-            header.arm7_overlays.offset..header.arm7_overlays.offset + header.arm7_overlays.size,
-        ];
-        sections.push(header.banner_offset..header.banner_offset + banner.version().banner_size() as u32);
-        arm9_overlays.iter().for_each(|overlay| {
-            let file = &fat[overlay.file_id as usize];
-            sections.push(file.start..file.end);
-        });
-        arm7_overlays.iter().for_each(|overlay| {
-            let file = &fat[overlay.file_id as usize];
-            sections.push(file.start..file.end);
-        });
-        sections.retain(|section| section.start != section.end);
-        sections.sort_by_key(|section| section.start);
-
-        // Find a gap between two adjacent sections, and return the padding byte between them
-        let Some(gap) = sections.windows(2).find(|pair| pair[0].end != pair[1].start) else {
-            return Ok(0xff);
-        };
-        log::debug!("Gap between sections: {:#010x} - {:#010x}", gap[0].end, gap[1].start);
         Ok(self.data[gap[0].end as usize])
     }
 
@@ -463,3 +511,5 @@ impl<'a> Rom<'a> {
         })
     }
 }
+
+const DEFAULT_PADDING_VALUE: u8 = 0xff;

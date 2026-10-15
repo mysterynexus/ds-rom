@@ -16,6 +16,9 @@ use log::LevelFilter;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    #[arg(long)]
+    debug: bool,
 }
 
 #[derive(Subcommand)]
@@ -36,9 +39,9 @@ impl Command {
 }
 
 fn main() -> Result<()> {
-    env_logger::builder().filter_level(LevelFilter::Info).init();
-
     let args: Cli = Cli::parse();
+    env_logger::builder().filter_level(if args.debug { LevelFilter::Debug } else { LevelFilter::Info }).init();
+
     args.command.run()
 }
 
@@ -50,6 +53,14 @@ pub fn print_hex(data: &[u8], raw: bool, base: u32) -> Result<()> {
             print!("{:08x} ", base as usize + offset * 16);
             for byte in chunk {
                 print!(" {byte:02x}");
+            }
+            for _ in chunk.len()..16 {
+                print!("   ");
+            }
+            print!("  ");
+            for &byte in chunk {
+                let ch = char::from(byte);
+                print!("{}", if ch.is_ascii_graphic() { ch } else { '.' });
             }
             println!();
         }

@@ -1,32 +1,38 @@
-use std::{borrow::Cow, io, mem::replace, ops::Range};
+use std::{borrow::Cow, io, mem::replace, ops::Range, str::Utf8Error};
 
 use serde::{Deserialize, Serialize};
 use snafu::{Backtrace, Snafu};
 
 use super::{
-    raw::{
-        AutoloadInfo, AutoloadInfoEntry, AutoloadKind, BuildInfo, HmacSha1Signature, HmacSha1SignatureError,
-        RawAutoloadInfoError, RawBuildInfoError, NITROCODE_BYTES,
-    },
     Autoload, OverlayTable,
+    raw::{
+        AutoloadInfo, AutoloadInfoEntry, AutoloadKind, BuildInfo, HmacSha1Signature, HmacSha1SignatureError, NITROCODE_BYTES,
+        RawAutoloadInfoError, RawBuildInfoError,
+    },
 };
 use crate::{
     compress::lz77::{Lz77, Lz77DecompressError},
     crc::CRC_16_MODBUS,
-    crypto::blowfish::{Blowfish, BlowfishError, BlowfishKey, BlowfishLevel},
+    crypto::{
+        blowfish::{Blowfish, BlowfishError, BlowfishKey, BlowfishLevel},
+        dsprot::{DsProtDecryptOptions, DsProtDecryptResult, DsProtEncryptOptions, DsProtError, DsProtInfo, DsProtState},
+    },
+    rom::LibraryEntry,
 };
 
 /// ARM9 program.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Arm9<'a> {
     data: Cow<'a, [u8]>,
     offsets: Arm9Offsets,
     originally_compressed: bool,
     originally_encrypted: bool,
+    dsprot_state: DsProtState,
+    has_footer: bool,
 }
 
 /// Offsets in the ARM9 program.
-#[derive(Serialize, Deserialize, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub struct Arm9Offsets {
     /// Base address.
     pub base_address: u32,
@@ -42,6 +48,11 @@ pub struct Arm9Offsets {
 
 const SECURE_AREA_ID: [u8; 8] = [0xff, 0xde, 0xff, 0xe7, 0xff, 0xde, 0xff, 0xe7];
 const SECURE_AREA_ENCRY_OBJ: &[u8] = "encryObj".as_bytes();
+
+/// Number of zero-bytes in the secure area for it to be considered unencrypted. This applies to a
+/// few retail games with a secure area which, after decryption, does not start with "encryObj" like
+/// it normally does.
+const SECURE_AREA_UNENCRYPTED_THRESHOLD: usize = 256;
 
 const LZ77: Lz77 = Lz77 {};
 
@@ -65,12 +76,6 @@ pub enum Arm9Error {
     Blowfish {
         /// Source error.
         source: BlowfishError,
-    },
-    /// Occurs when the string "encryObj" is not found when de/encrypting the secure area.
-    #[snafu(display("invalid encryption, 'encryObj' not found"))]
-    NotEncryObj {
-        /// Backtrace to the source of the error.
-        backtrace: Backtrace,
     },
     /// See [`RawBuildInfoError`].
     #[snafu(transparent)]
@@ -163,28 +168,77 @@ pub enum Arm9HmacSha1KeyError {
     },
 }
 
+/// Errors related to [`Arm9::dsprot_info`].
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum Arm9DsProtInfoError {
+    /// See [`RawBuildInfoError`].
+    #[snafu(transparent)]
+    RawBuildInfo {
+        /// Source error.
+        source: RawBuildInfoError,
+    },
+    /// Occurs when trying to detect DS Protect while the ARM9 program is compressed.
+    #[snafu(display("ARM9 program must be decompressed before detecting DS Protect:\n{backtrace}"))]
+    Compressed {
+        /// Backtrace to the source of the error.
+        backtrace: Backtrace,
+    },
+    /// See [`DsProtError`].
+    #[snafu(transparent)]
+    DsProtError {
+        /// Source error.
+        source: DsProtError,
+    },
+}
+
+/// Options for [`Arm9::new`].
+pub struct Arm9Options {
+    /// Whether the program has an [`Arm9Footer`](super::raw::Arm9Footer).
+    pub has_footer: bool,
+}
+
 /// Options for [`Arm9::with_two_tcms`].
 pub struct Arm9WithTcmsOptions {
     /// Whether the program was compressed originally.
     pub originally_compressed: bool,
     /// Whether the program was encrypted originally.
     pub originally_encrypted: bool,
+    /// Current state of DS Protect. Can be absent, encrypted or unencrypted.
+    pub dsprot_state: DsProtState,
+    /// Whether the program has an [`Arm9Footer`](super::raw::Arm9Footer).
+    pub has_footer: bool,
 }
 
 impl<'a> Arm9<'a> {
     /// Creates a new ARM9 program from raw data.
-    pub fn new<T: Into<Cow<'a, [u8]>>>(data: T, offsets: Arm9Offsets) -> Result<Self, RawBuildInfoError> {
-        let mut arm9 = Arm9 { data: data.into(), offsets, originally_compressed: false, originally_encrypted: false };
+    pub fn new<T: Into<Cow<'a, [u8]>>>(
+        data: T,
+        offsets: Arm9Offsets,
+        options: Arm9Options,
+    ) -> Result<Self, RawBuildInfoError> {
+        let Arm9Options { has_footer } = options;
+        let mut arm9 = Arm9 {
+            data: data.into(),
+            offsets,
+            originally_compressed: false,
+            originally_encrypted: false,
+            dsprot_state: DsProtState::None,
+            has_footer,
+        };
         arm9.originally_compressed = arm9.is_compressed()?;
         arm9.originally_encrypted = arm9.is_encrypted();
         Ok(arm9)
     }
 
+    /// Deprecated, use [`Arm9::with_autoloads`] instead.
+    ///
     /// Creates a new ARM9 program with raw data and two autoloads (ITCM and DTCM).
     ///
     /// # Errors
     ///
     /// See [`Self::build_info_mut`].
+    #[deprecated(note = "use Arm9::with_autoloads instead")]
     pub fn with_two_tcms(
         mut data: Vec<u8>,
         itcm: Autoload,
@@ -198,11 +252,14 @@ impl<'a> Arm9<'a> {
         data.extend(itcm.into_data().iter());
         data.extend(dtcm.into_data().iter());
         let autoload_infos_start = data.len() as u32 + offsets.base_address;
-        data.extend(bytemuck::bytes_of(&autoload_infos));
+        for entry in autoload_infos {
+            data.extend(entry.to_bytes());
+        }
         let autoload_infos_end = data.len() as u32 + offsets.base_address;
 
-        let Arm9WithTcmsOptions { originally_compressed, originally_encrypted } = options;
-        let mut arm9 = Self { data: data.into(), offsets, originally_compressed, originally_encrypted };
+        let Arm9WithTcmsOptions { originally_compressed, originally_encrypted, dsprot_state, has_footer } = options;
+        let mut arm9 =
+            Self { data: data.into(), offsets, originally_compressed, originally_encrypted, dsprot_state, has_footer };
 
         let build_info = arm9.build_info_mut()?;
         build_info.autoload_blocks = autoload_blocks;
@@ -231,12 +288,13 @@ impl<'a> Arm9<'a> {
 
         let autoload_infos_start = data.len() as u32 + offsets.base_address;
         for autoload in autoloads {
-            data.extend(bytemuck::bytes_of(autoload.info().entry()));
+            data.extend(autoload.info().entry().to_bytes());
         }
         let autoload_infos_end = data.len() as u32 + offsets.base_address;
 
-        let Arm9WithTcmsOptions { originally_compressed, originally_encrypted } = options;
-        let mut arm9 = Self { data: data.into(), offsets, originally_compressed, originally_encrypted };
+        let Arm9WithTcmsOptions { originally_compressed, originally_encrypted, dsprot_state, has_footer } = options;
+        let mut arm9 =
+            Self { data: data.into(), offsets, originally_compressed, originally_encrypted, dsprot_state, has_footer };
 
         let build_info = arm9.build_info_mut()?;
         build_info.autoload_blocks = autoload_blocks;
@@ -246,10 +304,23 @@ impl<'a> Arm9<'a> {
         Ok(arm9)
     }
 
+    /// Returns whether this ARM9 program is followed by an [`Arm9Footer`](super::raw::Arm9Footer) in the ROM. Most ROMs have
+    /// one, but some (mainly DSi-enhanced ones) put the build info offset in the ROM header instead and have no footer.
+    pub fn has_footer(&self) -> bool {
+        self.has_footer
+    }
+
     /// Returns whether the secure area is encrypted. See [`Self::originally_encrypted`] for whether the secure area was
     /// encrypted originally.
     pub fn is_encrypted(&self) -> bool {
-        self.data.len() < 8 || self.data[0..8] != SECURE_AREA_ID
+        if self.data.len() >= 8 && self.data[0..8] == SECURE_AREA_ID {
+            false
+        } else if self.data.len() >= 0x800 {
+            let zero_count = self.data[0..0x800].iter().filter(|&&b| b == 0).count();
+            zero_count < SECURE_AREA_UNENCRYPTED_THRESHOLD
+        } else {
+            true
+        }
     }
 
     /// Decrypts the secure area. Does nothing if already decrypted.
@@ -277,7 +348,7 @@ impl<'a> Arm9<'a> {
         blowfish.decrypt(&mut secure_area[0..0x800])?;
 
         if &secure_area[0..8] != SECURE_AREA_ENCRY_OBJ {
-            NotEncryObjSnafu {}.fail()?;
+            log::warn!("Failed to decrypt secure area");
         }
 
         secure_area[0..8].copy_from_slice(&SECURE_AREA_ID);
@@ -300,10 +371,6 @@ impl<'a> Arm9<'a> {
             DataTooSmallSnafu { expected: 0x4000usize, actual: self.data.len() }.fail()?;
         }
 
-        if self.data[0..8] != SECURE_AREA_ID {
-            NotEncryObjSnafu {}.fail()?;
-        }
-
         let secure_area = self.encrypted_secure_area(key, gamecode);
         self.data.to_mut()[0..0x4000].copy_from_slice(&secure_area);
         Ok(())
@@ -313,7 +380,7 @@ impl<'a> Arm9<'a> {
     pub fn encrypted_secure_area(&self, key: &BlowfishKey, gamecode: u32) -> [u8; 0x4000] {
         let mut secure_area = [0u8; 0x4000];
         secure_area.copy_from_slice(&self.data[0..0x4000]);
-        if self.is_encrypted() {
+        if self.data[0..8] != SECURE_AREA_ID {
             return secure_area;
         }
 
@@ -350,6 +417,43 @@ impl<'a> Arm9<'a> {
     /// See [`BuildInfo::borrow_from_slice_mut`].
     pub fn build_info_mut(&mut self) -> Result<&mut BuildInfo, RawBuildInfoError> {
         BuildInfo::borrow_from_slice_mut(&mut self.data.to_mut()[self.offsets.build_info as usize..])
+    }
+
+    /// Returns the library version strings in this [`Arm9`].
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if a library string is not valid UTF-8.
+    pub fn libraries(&self) -> Result<Box<[LibraryEntry<'_>]>, Utf8Error> {
+        let libraries_start = self.offsets.build_info as usize + size_of::<BuildInfo>();
+        let mut address = self.base_address() + libraries_start as u32;
+        let mut data = &self.data[libraries_start..];
+
+        let mut libraries = Vec::new();
+
+        'outer: while data[0] == b'[' {
+            let Some((end_pos, _)) = data.iter().enumerate().find(|(_, c)| **c == b']') else {
+                break;
+            };
+            let version_string = str::from_utf8(&data[..end_pos + 1])?;
+
+            libraries.push(LibraryEntry::new(address, version_string));
+
+            address += end_pos as u32 + 1;
+            data = &data[end_pos + 1..];
+            loop {
+                match data[0] {
+                    b'\0' => {
+                        address += 1;
+                        data = &data[1..]
+                    }
+                    b'[' => break,
+                    _ => break 'outer,
+                }
+            }
+        }
+
+        Ok(libraries.into_boxed_slice())
     }
 
     /// Returns whether this ARM9 program is compressed. See [`Self::originally_compressed`] for whether the program was
@@ -410,10 +514,12 @@ impl<'a> Arm9<'a> {
         Ok(())
     }
 
-    fn get_autoload_info_entries(&self, build_info: &BuildInfo) -> Result<&[AutoloadInfoEntry], Arm9AutoloadError> {
+    fn get_autoload_info_entries(&self, build_info: &BuildInfo) -> Result<Vec<AutoloadInfoEntry>, Arm9AutoloadError> {
         let start = (build_info.autoload_infos_start - self.base_address()) as usize;
         let end = (build_info.autoload_infos_end - self.base_address()) as usize;
-        let autoload_info = AutoloadInfoEntry::borrow_from_slice(&self.data[start..end])?;
+        // The autoload blocks are located right before the autoload list
+        let blocks_size = build_info.autoload_infos_start - build_info.autoload_blocks;
+        let autoload_info = AutoloadInfoEntry::parse_list(&self.data[start..end], blocks_size)?;
         Ok(autoload_info)
     }
 
@@ -430,9 +536,9 @@ impl<'a> Arm9<'a> {
         }
         Ok(self
             .get_autoload_info_entries(build_info)?
-            .iter()
+            .into_iter()
             .enumerate()
-            .map(|(index, entry)| AutoloadInfo::new(*entry, index as u32))
+            .map(|(index, entry)| AutoloadInfo::new(entry, index as u32))
             .collect())
     }
 
@@ -442,7 +548,7 @@ impl<'a> Arm9<'a> {
     ///
     /// This function will return an error if [`Self::build_info`] or [`Self::get_autoload_infos`] fails or this ARM9 program
     /// is compressed.
-    pub fn autoloads(&self) -> Result<Box<[Autoload]>, Arm9AutoloadError> {
+    pub fn autoloads(&self) -> Result<Box<[Autoload<'_>]>, Arm9AutoloadError> {
         let build_info = self.build_info()?;
         if build_info.is_compressed() {
             CompressedSnafu {}.fail()?;
@@ -507,7 +613,7 @@ impl<'a> Arm9<'a> {
         if end > self.data.len() {
             return Ok(None);
         }
-        return Ok(Some(start..end));
+        Ok(Some(start..end))
     }
 
     /// Returns the ARM9 overlay table signature.
@@ -555,7 +661,7 @@ impl<'a> Arm9<'a> {
         if end > self.data.len() {
             return Ok(None);
         }
-        return Ok(Some(start..end));
+        Ok(Some(start..end))
     }
 
     /// Returns the ARM9 overlay signature table.
@@ -691,7 +797,72 @@ impl<'a> Arm9<'a> {
             offsets: self.offsets,
             originally_compressed: self.originally_compressed,
             originally_encrypted: self.originally_encrypted,
+            dsprot_state: self.dsprot_state,
+            has_footer: self.has_footer,
         }
+    }
+
+    /// Decrypts all functions in this ARM9 program that were encrypted by DS Protect. Does nothing
+    /// if [`Arm9::dsprot_state`] is [`DsProtState::Unencrypted`].
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if [`DsProtInfo::decrypt`] fails.
+    pub fn decrypt_dsprot(
+        &mut self,
+        options: &DsProtDecryptOptions,
+    ) -> Result<Option<&DsProtDecryptResult>, Arm9DsProtInfoError> {
+        if self.dsprot_state.is_unencrypted() {
+            // Can't flatten this code due to conditional reference return (known borrow checker limitation)
+            if let DsProtState::Unencrypted(result) = &self.dsprot_state {
+                Ok(Some(result))
+            } else {
+                unreachable!();
+            }
+        } else {
+            let dsprot_info = if self.is_compressed()? {
+                return arm9_ds_prot_info_error::CompressedSnafu.fail();
+            } else if let Some(dsprot_info) = DsProtInfo::detect(&self.data) {
+                dsprot_info
+            } else {
+                // DS Protect is not used
+                return Ok(None);
+            };
+
+            let base_address = self.base_address();
+            let result = dsprot_info.decrypt(self.data.to_mut(), base_address, options)?;
+            self.dsprot_state = DsProtState::Unencrypted(result);
+            let DsProtState::Unencrypted(result) = &self.dsprot_state else { unreachable!() };
+            Ok(Some(result))
+        }
+    }
+
+    /// Encrypts DS Protect functions in this ARM9 program. This can only be done if
+    /// [`Arm9::dsprot_state`] is [`DsProtState::Unencrypted`].
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if [`DsProtInfo::decrypt`] fails.
+    pub fn encrypt_dsprot(&mut self, options: &DsProtEncryptOptions) -> Result<(), Arm9DsProtInfoError> {
+        let dsprot_state = std::mem::replace(&mut self.dsprot_state, DsProtState::None);
+        let DsProtState::Unencrypted(dsprot_result) = dsprot_state else {
+            return Ok(());
+        };
+
+        let base_address = self.base_address();
+        dsprot_result.encrypt(self.data.to_mut(), base_address, options)?;
+        self.dsprot_state = DsProtState::Encrypted(dsprot_result);
+
+        Ok(())
+    }
+
+    /// Returns the [`DsProtState`] of this ARM9 program.
+    pub fn dsprot_state(&self) -> &DsProtState {
+        &self.dsprot_state
+    }
+
+    pub(crate) fn set_dsprot_state(&mut self, dsprot_state: DsProtState) {
+        self.dsprot_state = dsprot_state;
     }
 }
 

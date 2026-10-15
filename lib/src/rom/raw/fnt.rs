@@ -68,11 +68,7 @@ pub enum RawFntError {
 impl<'a> Fnt<'a> {
     fn check_size(data: &'_ [u8]) -> Result<(), RawFntError> {
         let size = size_of::<FntDirectory>();
-        if data.len() < size {
-            InvalidSizeSnafu {}.fail()
-        } else {
-            Ok(())
-        }
+        if data.len() < size { InvalidSizeSnafu {}.fail() } else { Ok(()) }
     }
 
     fn handle_pod_cast<T>(result: Result<T, PodCastError>) -> T {
@@ -93,7 +89,7 @@ impl<'a> Fnt<'a> {
     pub fn borrow_from_slice(data: &'a [u8]) -> Result<Self, RawFntError> {
         Self::check_size(data)?;
         let addr = data as *const [u8] as *const () as usize;
-        if addr % 4 != 0 {
+        if !addr.is_multiple_of(4) {
             return MisalignedSnafu { expected: 4usize, actual: 1usize << addr.trailing_zeros() as usize }.fail();
         }
 
@@ -146,7 +142,7 @@ impl<'a> Fnt<'a> {
 
 impl FntSubtable<'_> {
     /// Returns an iterator over all immediate children (files and directories) in this subtable.
-    pub fn iter(&self) -> IterFntSubtable {
+    pub fn iter(&self) -> IterFntSubtable<'_> {
         IterFntSubtable { data: &self.data, id: self.directory.first_file_id }
     }
 }
